@@ -257,9 +257,26 @@ impl Connection {
             // `tunnel.host` is a bare ssh destination (a ~/.ssh/config Host alias
             // or hostname), passed as ssh's positional argument. ssh doesn't accept
             // `host:port` syntax there (that needs `-p` or a `ssh://` URI), so a
-            // colon signals a copy-pasted connection-string-style value.
+            // colon signals a copy-pasted connection-string-style value. IPv6
+            // bastions aren't representable here — use a ~/.ssh/config Host alias
+            // for those instead; that's a deliberate MVP0 limitation, not an
+            // oversight.
             if tunnel.host.contains(':') {
                 return Err(invalid_field("tunnel.host", "must not contain ':'"));
+            }
+            // `tunnel.host` is combined with `tunnel.user` into a single
+            // `user@host` destination string by the tunnel command builder; an
+            // '@' inside `host` itself would be ambiguous with that separator.
+            // `tunnel.user` has no such ambiguity (it's passed as the literal
+            // characters before the injected '@'), so email-style login names
+            // like `alice@corp.com` (common on LDAP/SSO-fronted bastions) are
+            // fine there — see TunnelSpec::from_parts (Phase 2), which is the
+            // sole gate before argv construction and agrees.
+            if tunnel.host.contains('@') {
+                return Err(invalid_field(
+                    "tunnel.host",
+                    "must not contain '@' — put the login name in `user` instead",
+                ));
             }
             if let Some(user) = &tunnel.user {
                 if user.trim().is_empty() {
@@ -271,6 +288,19 @@ impl Connection {
             }
             if tunnel.port == Some(0) {
                 return Err(zero_port("tunnel.port"));
+            }
+
+            // `host` becomes the third field of ssh's `-L local:host:hostport`
+            // triple in Phase 2; a bare ':' there would silently corrupt the
+            // forward spec. IPv6 literals are legitimate — the tunnel builder
+            // brackets them. This check is gated on tunnel.is_some() because
+            // without a tunnel, `host` goes straight to tokio-postgres, which
+            // accepts IPv6 literals directly.
+            if self.host.contains(':') && self.host.parse::<std::net::Ipv6Addr>().is_err() {
+                return Err(invalid_field(
+                    "host",
+                    "must not contain ':' unless it is an IPv6 literal",
+                ));
             }
         }
 
@@ -593,6 +623,62 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn validate_rejects_host_with_colon_when_tunnel_present_and_host_not_ipv6() {
+        let mut connection = minimal_connection();
+        connection.host = "db.internal:5432".to_string();
+        connection.tunnel = Some(SshTunnel {
+            host: "bastion".to_string(),
+            user: None,
+            port: None,
+        });
+        let config = Config {
+            connections: vec![connection],
+        };
+
+        let err = config
+            .validate()
+            .expect_err("colon-containing non-IPv6 host with a tunnel is invalid");
+        assert!(matches!(
+            err,
+            ConfigError::InvalidField { field: "host", .. }
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_ipv6_literal_host_when_tunnel_present() {
+        let mut connection = minimal_connection();
+        connection.host = "::1".to_string();
+        connection.tunnel = Some(SshTunnel {
+            host: "bastion".to_string(),
+            user: None,
+            port: None,
+        });
+        let config = Config {
+            connections: vec![connection],
+        };
+
+        config
+            .validate()
+            .expect("an IPv6 literal host with a tunnel is valid");
+    }
+
+    #[test]
+    fn validate_accepts_host_with_colon_when_no_tunnel_present() {
+        // Without a tunnel, `host` goes straight to tokio-postgres, which
+        // accepts IPv6 literals directly — the colon check is tunnel-only.
+        let mut connection = minimal_connection();
+        connection.host = "not-ipv6:but-no-tunnel".to_string();
+        connection.tunnel = None;
+        let config = Config {
+            connections: vec![connection],
+        };
+
+        config
+            .validate()
+            .expect("host colon check only applies when a tunnel is configured");
     }
 
     #[test]
