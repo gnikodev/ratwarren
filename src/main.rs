@@ -1,86 +1,114 @@
-use std::io;
+use std::process::ExitCode;
+use std::sync::Arc;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::{
-    DefaultTerminal, Frame,
-    layout::Alignment,
-    widgets::{Block, Borders, Paragraph},
-};
+use ratwarren::app::{self, App};
+use ratwarren::config::Config;
+use ratwarren::datasource::{DataSource, PostgresDataSource};
 
-fn main() -> io::Result<()> {
+#[tokio::main]
+async fn main() -> ExitCode {
+    let config = match Config::load() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("failed to load config: {}", ratwarren::ui::error_chain(&e));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let name = match pick_connection(&config) {
+        Ok(name) => name,
+        Err(code) => return code,
+    };
+    let conn = config
+        .connection(&name)
+        .expect("pick_connection only returns names present in config");
+
+    let password = std::env::var("RATWARREN_PASSWORD").ok();
+    if conn.password.is_some() && password.is_none() {
+        eprintln!(
+            "note: connection {name:?} has a keyring password configured, but keyring-based \
+             secret resolution isn't wired up until Phase 8 — set RATWARREN_PASSWORD in the \
+             environment to supply the password for now."
+        );
+    }
+
+    eprintln!("connecting to {name}…");
+    let source = match PostgresDataSource::connect(conn, password.as_deref()).await {
+        Ok(source) => source,
+        Err(e) => {
+            eprintln!("{}", ratwarren::ui::error_chain(&e));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let pg = Arc::new(source);
+    let worker_source: Arc<dyn DataSource> = pg.clone();
+
+    let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel();
+    let worker_handle = app::worker::spawn(worker_source, request_rx, response_tx);
+
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal);
+    let mut app = App::new(name, request_tx, response_rx);
+    let result = app::run(&mut terminal, &mut app).await;
     ratatui::restore();
-    result
-}
 
-fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
-    loop {
-        terminal.draw(render)?;
+    // `app` owns the last clone of `request_tx` outside the worker task
+    // itself; drop it explicitly so the worker's `requests.recv().await`
+    // loop observes the channel close.
+    drop(app);
 
-        if let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-            && key.code == KeyCode::Char('q')
-        {
-            return Ok(());
+    // The worker only notices the channel closing *after* its current
+    // `handle(...).await` call returns, and nothing times out a request
+    // against an unresponsive connection — so a plain `.await` here can hang
+    // forever with the terminal already restored. Abort it instead: for a
+    // quit path in a single-user tool, not waiting for an in-flight
+    // DataSource call to finish is the right tradeoff, since nothing
+    // consumes its response after quit anyway. `worker_handle.await`
+    // resolves promptly once the task notices the abort at its next await
+    // point, which drops its `Arc<dyn DataSource>` clone — a precondition
+    // for `Arc::into_inner` below to succeed.
+    worker_handle.abort();
+    let _ = worker_handle.await;
+
+    // `None` only if something above still holds a clone; the tunnel's own
+    // Drop impl reaps the ssh child regardless, so that case is safe to skip.
+    if let Some(pg) = Arc::into_inner(pg) {
+        pg.close().await;
+    }
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
         }
     }
 }
 
-fn render(frame: &mut Frame) {
-    let block = Block::default().title(" ratwarren ").borders(Borders::ALL);
-    let paragraph = Paragraph::new("ratwarren — press 'q' to quit")
-        .block(block)
-        .alignment(Alignment::Center);
-    frame.render_widget(paragraph, frame.area());
+fn pick_connection(config: &Config) -> Result<String, ExitCode> {
+    if let Some(name) = std::env::args().nth(1) {
+        if config.connection(&name).is_some() {
+            return Ok(name);
+        }
+        print_available(config);
+        return Err(ExitCode::from(2));
+    }
+    if config.connections.len() == 1 {
+        return Ok(config.connections[0].name.clone());
+    }
+    print_available(config);
+    Err(ExitCode::from(2))
 }
 
-#[cfg(test)]
-mod tests {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-
-    use super::render;
-
-    fn rendered_lines(width: u16, height: u16) -> Vec<String> {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).expect("TestBackend init is infallible");
-        terminal
-            .draw(render)
-            .expect("TestBackend draw is infallible");
-
-        let buffer = terminal.backend().buffer();
-        (0..height)
-            .map(|y| {
-                (0..width)
-                    .map(|x| buffer.cell((x, y)).expect("in bounds").symbol())
-                    .collect()
-            })
-            .collect()
+fn print_available(config: &Config) {
+    if config.connections.is_empty() {
+        eprintln!("no connections configured");
+        return;
     }
-
-    #[test]
-    fn shows_title_in_border_and_quit_hint_in_body() {
-        let lines = rendered_lines(40, 3);
-
-        assert!(
-            lines[0].contains("ratwarren"),
-            "top border should carry the ` ratwarren ` title, got: {:?}",
-            lines[0]
-        );
-        let body = lines[1].trim_matches(|c: char| c == '│' || c.is_whitespace());
-        assert_eq!(
-            body, "ratwarren — press 'q' to quit",
-            "body row should show the quit hint, got: {:?}",
-            lines[1]
-        );
-    }
-
-    #[test]
-    fn survives_a_terminal_too_small_to_fit_the_text() {
-        // 1x1 leaves no room for the border or the paragraph; render() must not panic
-        // even though every widget it draws would need more space than it's given.
-        let lines = rendered_lines(1, 1);
-        assert_eq!(lines.len(), 1);
+    eprintln!("usage: ratwarren <connection-name>");
+    eprintln!("available connections:");
+    for conn in &config.connections {
+        eprintln!("  {}", conn.name);
     }
 }

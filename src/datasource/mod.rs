@@ -81,7 +81,7 @@ pub enum DataSourceError {
         name: String,
         reason: Option<String>,
     },
-    #[error("query failed: {source}")]
+    #[error("query failed")]
     Query {
         sql: String,
         #[source]
