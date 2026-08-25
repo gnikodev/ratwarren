@@ -92,9 +92,9 @@ pub enum DataSourceError {
     #[error("connection {name:?} is busy with another query")]
     Busy { name: String },
     #[error(
-        "`{method}` requires a single SQL statement; the server executed more than one and the extra results were discarded"
+        "requires a single SQL statement; the server executed more than one and the extra results were discarded"
     )]
-    MultipleStatements { method: &'static str },
+    MultipleStatements,
     #[error("connection {name:?}: failed to deliver the cancel request")]
     CancelFailed {
         name: String,

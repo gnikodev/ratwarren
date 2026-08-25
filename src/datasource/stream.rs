@@ -136,7 +136,7 @@ impl RowStream {
 
     fn multi_statement(&mut self) -> DataSourceError {
         self.state = StreamState::Aborted;
-        DataSourceError::MultipleStatements { method: "execute" }
+        DataSourceError::MultipleStatements
     }
 
     pub async fn take(&mut self, max: usize) -> Result<Vec<Row>, DataSourceError> {
@@ -306,6 +306,131 @@ mod tests {
             active_id.load(Ordering::Acquire),
             42,
             "a stale stream's Drop must not clear an active_id that has since moved to a newer query"
+        );
+    }
+
+    // A genuine two-statement batch: the first statement's full result
+    // (Columns, Row, Complete) followed by a second statement's
+    // RowDescription arriving on the same simple_query_raw stream. Draining
+    // the first row and then hitting Complete must not silently end the
+    // stream (that would drop the second statement's results without any
+    // signal) — the next poll must surface MultipleStatements.
+    #[tokio::test]
+    async fn columns_row_complete_then_columns_reports_multiple_statements() {
+        let active_id = Arc::new(AtomicU64::new(1));
+        let mut rs = test_row_stream(
+            Arc::clone(&active_id),
+            1,
+            vec![
+                Ok(ResultMessage::Columns(Arc::from(vec!["a".to_string()]))),
+                Ok(ResultMessage::Row(vec![Some("1".to_string())])),
+                Ok(ResultMessage::Complete { rows_affected: 1 }),
+                Ok(ResultMessage::Columns(Arc::from(vec!["b".to_string()]))),
+            ],
+            StreamState::Streaming,
+        );
+
+        let first = rs.next().await;
+        assert!(
+            matches!(first, Some(Ok(_))),
+            "expected the single row from the first statement, got {first:?}"
+        );
+
+        let second = rs.next().await;
+        assert!(
+            matches!(second, Some(Err(DataSourceError::MultipleStatements))),
+            "a RowDescription arriving after the first statement's Complete must be reported as \
+             MultipleStatements, not silently ended, got {second:?}"
+        );
+    }
+
+    // Two zero-row/DDL-style statements back to back (e.g. two CREATE
+    // TABLEs): no Columns/Row messages at all, just two Completes. This must
+    // be distinguished from the single-statement zero-row case below. Since
+    // the first Complete only flips internal state (AfterComplete) and
+    // loops rather than returning to the caller, a single next() call
+    // drains straight through to the second Complete and must surface
+    // MultipleStatements from that very first call — not None.
+    #[tokio::test]
+    async fn two_completes_in_a_row_reports_multiple_statements() {
+        let active_id = Arc::new(AtomicU64::new(2));
+        let mut rs = test_row_stream(
+            Arc::clone(&active_id),
+            2,
+            vec![
+                Ok(ResultMessage::Complete { rows_affected: 0 }),
+                Ok(ResultMessage::Complete { rows_affected: 0 }),
+            ],
+            StreamState::Streaming,
+        );
+
+        let first = rs.next().await;
+        assert!(
+            matches!(first, Some(Err(DataSourceError::MultipleStatements))),
+            "a second Complete arriving right after the first must be reported as \
+             MultipleStatements, got {first:?}"
+        );
+        assert_eq!(rs.state, StreamState::Aborted);
+    }
+
+    // Pinned regression test: a single statement that affects zero rows
+    // (e.g. `UPDATE ... WHERE false`) produces exactly one Complete and then
+    // the underlying stream ends (ReadyForQuery). This must reach
+    // StreamState::Ended cleanly and must NOT be misclassified as
+    // MultipleStatements just because there were no Row messages to
+    // distinguish it from the two-Completes case above.
+    #[tokio::test]
+    async fn single_complete_then_stream_end_reaches_ended_not_multiple_statements() {
+        let active_id = Arc::new(AtomicU64::new(3));
+        let mut rs = test_row_stream(
+            Arc::clone(&active_id),
+            3,
+            vec![Ok(ResultMessage::Complete { rows_affected: 0 })],
+            StreamState::Streaming,
+        );
+
+        let first = rs.next().await;
+        assert!(
+            first.is_none(),
+            "single zero-row statement should end with None, got {first:?}"
+        );
+        assert_eq!(rs.state, StreamState::Ended);
+
+        let second = rs.next().await;
+        assert!(
+            second.is_none(),
+            "polling an already-Ended stream must keep returning None, got {second:?}"
+        );
+        assert_eq!(active_id.load(Ordering::Acquire), 0);
+    }
+
+    // Once MultipleStatements has been surfaced, the stream is Aborted:
+    // further polls must not loop, panic, or re-return the error — they
+    // must just return None.
+    #[tokio::test]
+    async fn after_multiple_statements_error_state_is_aborted_and_next_returns_none() {
+        let active_id = Arc::new(AtomicU64::new(4));
+        let mut rs = test_row_stream(
+            Arc::clone(&active_id),
+            4,
+            vec![
+                Ok(ResultMessage::Complete { rows_affected: 0 }),
+                Ok(ResultMessage::Complete { rows_affected: 0 }),
+            ],
+            StreamState::Streaming,
+        );
+
+        let err = rs.next().await;
+        assert!(matches!(
+            err,
+            Some(Err(DataSourceError::MultipleStatements))
+        ));
+        assert_eq!(rs.state, StreamState::Aborted);
+
+        let after = rs.next().await;
+        assert!(
+            after.is_none(),
+            "polling an Aborted stream must return None, not loop or re-return the error, got {after:?}"
         );
     }
 

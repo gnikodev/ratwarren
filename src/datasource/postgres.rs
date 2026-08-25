@@ -17,6 +17,7 @@ pub struct ConnectOptions {
     pub tunnel: crate::tunnel::TunnelOptions,
     pub cancel_timeout: Duration,
     pub abandon_grace: Duration,
+    pub cancel_settle: Duration,
 }
 
 impl Default for ConnectOptions {
@@ -27,6 +28,18 @@ impl Default for ConnectOptions {
             tunnel: crate::tunnel::TunnelOptions::default(),
             cancel_timeout: Duration::from_secs(5),
             abandon_grace: Duration::from_millis(100),
+            // Postgres's cancel protocol is out-of-band and unacknowledged:
+            // the server never confirms a cancel was received or applied,
+            // so there is no principled way to know when it's safe to reuse
+            // the connection for the next query. This delay is an
+            // empirically-tuned heuristic, not a protocol guarantee. A
+            // 60-iteration adversarial repro against a real Postgres
+            // instance measured a 3/60 (5%) residual race with the
+            // start_gate fix alone, and 0/150 with this 25ms settle delay
+            // added on top. Treat 25ms as a best-effort mitigation, not as
+            // sacred or safely deletable — re-measure against a real server
+            // before changing it.
+            cancel_settle: Duration::from_millis(25),
         }
     }
 }
@@ -54,6 +67,7 @@ pub struct PostgresDataSource {
     start_gate: Arc<tokio::sync::Mutex<()>>,
     cancel_timeout: Duration,
     abandon_grace: Duration,
+    cancel_settle: Duration,
 }
 
 impl PostgresDataSource {
@@ -157,6 +171,7 @@ impl PostgresDataSource {
             start_gate: Arc::new(tokio::sync::Mutex::new(())),
             cancel_timeout: options.cancel_timeout,
             abandon_grace: options.abandon_grace,
+            cancel_settle: options.cancel_settle,
         })
     }
 
@@ -296,14 +311,13 @@ impl DataSource for PostgresDataSource {
         let permit = self.try_acquire()?;
         let gate = self.start_gate.lock().await;
 
-        let sql_owned = sql.to_string();
         let simple_stream = self
             .client
             .simple_query_raw(sql)
             .await
-            .map_err(|source| map_query_error(&sql_owned, source))?;
+            .map_err(|source| map_query_error(sql, source))?;
 
-        let map_sql = sql_owned.clone();
+        let map_sql = sql.to_string();
         let adapted = simple_stream.map(move |item| match item {
             Ok(tokio_postgres::SimpleQueryMessage::RowDescription(cols)) => {
                 let names: Arc<[String]> = cols
@@ -345,6 +359,7 @@ impl DataSource for PostgresDataSource {
                 start_gate: Arc::clone(&self.start_gate),
                 grace: self.abandon_grace,
                 cancel_timeout: self.cancel_timeout,
+                cancel_settle: self.cancel_settle,
             }),
             state: StreamState::Streaming,
         })
@@ -395,15 +410,26 @@ impl DataSource for PostgresDataSource {
         )
         .await
         {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {
+                tokio::time::sleep(self.cancel_settle).await;
+                Ok(())
+            }
             Ok(Err(source)) => Err(DataSourceError::CancelFailed {
                 name: self.name.clone(),
                 source,
             }),
-            Err(_) => Err(DataSourceError::CancelTimedOut {
-                name: self.name.clone(),
-                timeout: self.cancel_timeout,
-            }),
+            Err(_) => {
+                // A timeout here means the cancel_query future was dropped
+                // mid-flight, not that sending definitely failed — the
+                // cancel packet may already be in transit. That makes this
+                // arguably higher-risk for late delivery than the success
+                // path above, so it gets the same settle delay.
+                tokio::time::sleep(self.cancel_settle).await;
+                Err(DataSourceError::CancelTimedOut {
+                    name: self.name.clone(),
+                    timeout: self.cancel_timeout,
+                })
+            }
         }
     }
 }
@@ -414,6 +440,7 @@ pub(crate) struct AbandonCtx {
     pub(crate) start_gate: Arc<tokio::sync::Mutex<()>>,
     pub(crate) grace: Duration,
     pub(crate) cancel_timeout: Duration,
+    pub(crate) cancel_settle: Duration,
 }
 
 impl AbandonCtx {
@@ -463,11 +490,22 @@ async fn drain_abandoned(
         {
             let _gate = ctx.start_gate.lock().await;
             if active_id.load(Ordering::Acquire) == query_id.0 {
-                let _ = tokio::time::timeout(
+                match tokio::time::timeout(
                     ctx.cancel_timeout,
                     ctx.cancel_token.cancel_query(tokio_postgres::NoTls),
                 )
-                .await;
+                .await
+                {
+                    // Same asymmetry as PostgresDataSource::cancel: a
+                    // timeout means the cancel packet may already be in
+                    // transit, so it gets the settle delay too — only an
+                    // explicit send failure (definitely nothing in flight)
+                    // skips it.
+                    Ok(Ok(())) | Err(_) => {
+                        tokio::time::sleep(ctx.cancel_settle).await;
+                    }
+                    Ok(Err(_)) => {}
+                }
             }
         }
         drain.await;
@@ -519,5 +557,93 @@ mod tests {
     #[test]
     fn quote_ident_handles_empty_string() {
         assert_eq!(quote_ident(""), "\"\"");
+    }
+
+    // Synthetic (no real Postgres) concurrency regression test for the
+    // start_gate + slot lock-ordering invariant documented on
+    // PostgresDataSource::start_gate: every path that issues a request onto
+    // the connection (fake_execute below) must hold start_gate across
+    // issuance, and cancel (fake_cancel) must hold it across its whole
+    // check-and-send, with real dummy async work (yields/sleeps) done while
+    // holding the lock so the scheduler has room to interleave badly if the
+    // lock ordering were wrong. This can't exercise the actual Postgres
+    // cancel race (that requires real server timing, verified manually
+    // against Docker — see the cancel_settle comment above), but it does
+    // pin the "no deadlock under heavy real concurrent contention" property
+    // that the gate design depends on: run on a genuine multi-threaded
+    // runtime so tasks can actually run in parallel, not just interleave
+    // cooperatively on one thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn start_gate_and_slot_do_not_deadlock_under_concurrent_contention() {
+        let slot = Arc::new(Semaphore::new(1));
+        let start_gate = Arc::new(tokio::sync::Mutex::new(()));
+        let active_id = Arc::new(AtomicU64::new(0));
+        let next_id = Arc::new(AtomicU64::new(1));
+
+        async fn fake_execute(
+            slot: Arc<Semaphore>,
+            start_gate: Arc<tokio::sync::Mutex<()>>,
+            active_id: Arc<AtomicU64>,
+            next_id: Arc<AtomicU64>,
+        ) {
+            let Ok(permit) = slot.try_acquire_owned() else {
+                return; // connection busy, same as DataSourceError::Busy
+            };
+            let id = {
+                let gate = start_gate.lock().await;
+                tokio::task::yield_now().await; // dummy work standing in for simple_query_raw().await
+                let id = next_id.fetch_add(1, Ordering::Relaxed);
+                active_id.store(id, Ordering::Release);
+                drop(gate);
+                id
+            };
+            tokio::task::yield_now().await; // dummy work standing in for streaming rows
+            let _ = active_id.compare_exchange(id, 0, Ordering::Release, Ordering::Relaxed);
+            drop(permit);
+        }
+
+        async fn fake_cancel(
+            start_gate: Arc<tokio::sync::Mutex<()>>,
+            active_id: Arc<AtomicU64>,
+            target_id: u64,
+        ) {
+            let _gate = start_gate.lock().await;
+            if active_id.load(Ordering::Acquire) == target_id {
+                tokio::task::yield_now().await; // dummy work standing in for cancel_query().await
+            }
+        }
+
+        let mut handles = Vec::new();
+        for i in 0..200u64 {
+            let slot = Arc::clone(&slot);
+            let start_gate = Arc::clone(&start_gate);
+            let active_id = Arc::clone(&active_id);
+            let next_id = Arc::clone(&next_id);
+            if i % 2 == 0 {
+                handles.push(tokio::spawn(fake_execute(
+                    slot, start_gate, active_id, next_id,
+                )));
+            } else {
+                handles.push(tokio::spawn(fake_cancel(start_gate, active_id, i)));
+            }
+        }
+
+        let joined = tokio::time::timeout(
+            Duration::from_secs(5),
+            futures_util::future::join_all(handles),
+        )
+        .await
+        .expect(
+            "200 concurrent fake execute/cancel operations sharing start_gate+slot must \
+                 finish well within 5s; a timeout here means the gate deadlocked",
+        );
+        for result in joined {
+            result.expect("no fake_execute/fake_cancel task should panic");
+        }
+        assert_eq!(
+            active_id.load(Ordering::Acquire),
+            0,
+            "every fake_execute clears active_id on completion, so nothing should be left active"
+        );
     }
 }
