@@ -29,10 +29,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use ratwarren::app::worker;
 use ratwarren::config::Connection;
 use ratwarren::datasource::{
     ConnectOptions, DataSource, DataSourceError, PostgresDataSource, Row, TableKind, quote_ident,
+    select_page_sql,
 };
+use ratwarren::ui::grid::page::FETCH_LIMIT;
 
 fn pg_test_enabled() -> bool {
     std::env::var("RATWARREN_TEST_PG").as_deref() == Ok("1")
@@ -511,6 +514,59 @@ async fn cancel_stops_an_in_flight_query() {
     }
 }
 
+// --- 8b. mid-query connection death must not hang fetch_page forever ---
+//
+// Regression test for the finish()-Aborted-branch infinite loop: once
+// Postgres kills the backend mid-query, tokio_postgres's underlying response
+// stream is not fused and yields Err on every subsequent poll forever (never
+// Pending, never None). `worker::fetch_page` -> `RowStream::finish()` must
+// still return promptly instead of spinning at 100% CPU. `pg_terminate_backend`
+// targeting a backend obtained from a separate connection is reliable enough
+// in practice for this to be a permanent regression test rather than a
+// manual-only check, but it's still wrapped in a generous timeout so any
+// regression fails the test suite loudly instead of hanging it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_page_returns_promptly_when_the_connection_is_killed_mid_query() {
+    require_pg!();
+    let ds = connect().await;
+    let killer = connect().await;
+
+    let pid_row = exec_to_completion(&ds, "SELECT pg_backend_pid()")
+        .await
+        .expect("pg_backend_pid should succeed")
+        .into_iter()
+        .next()
+        .expect("expected exactly one row");
+    let pid: i32 = pid_row
+        .get(0)
+        .expect("pg_backend_pid column should be present")
+        .parse()
+        .expect("pg_backend_pid should return an integer");
+
+    let fetch = tokio::spawn(async move { worker::fetch_page(&ds, "SELECT pg_sleep(30)").await });
+
+    // Give fetch_page's execute() time to actually issue the query before
+    // terminating the backend, so the kill lands mid-query rather than
+    // racing the connection setup.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    exec_to_completion(&killer, &format!("SELECT pg_terminate_backend({pid})"))
+        .await
+        .expect("pg_terminate_backend should succeed");
+
+    let result = tokio::time::timeout(Duration::from_secs(5), fetch)
+        .await
+        .expect(
+            "fetch_page must return within 5s of the backend being terminated mid-query, not \
+             hang forever spinning on a not-fused, always-Err stream",
+        )
+        .expect("the fetch_page task should not panic");
+
+    assert!(
+        result.is_err(),
+        "fetch_page against a killed backend should surface a connection error, got {result:?}"
+    );
+}
+
 // --- 9. cancel with a stale query id is a no-op ---
 
 #[tokio::test]
@@ -670,4 +726,262 @@ async fn connect_to_an_unreachable_port_returns_a_connect_error() {
         Err(other) => panic!("expected DataSourceError::Connect, got a different error: {other:?}"),
         Ok(_) => panic!("expected DataSourceError::Connect, got Ok(_)"),
     }
+}
+
+// --- 14+. worker::fetch_page: pagination boundaries and the drain-before-drop
+// invariant against a real server's simple-query wire protocol ---
+
+async fn create_numbered_table(ds: &PostgresDataSource, schema: &str, n: u64) {
+    let q = quote_ident(schema);
+    exec_to_completion(ds, &format!("CREATE TABLE {q}.t (n int)"))
+        .await
+        .expect("create table");
+    if n > 0 {
+        exec_to_completion(
+            ds,
+            &format!("INSERT INTO {q}.t SELECT * FROM generate_series(1, {n})"),
+        )
+        .await
+        .expect("insert rows");
+    }
+}
+
+#[tokio::test]
+async fn fetch_page_drains_before_returning_so_the_connection_is_immediately_reusable() {
+    require_pg!();
+    let ds = connect().await;
+    let schema = unique_schema("fetchdrain");
+    create_schema(&ds, &schema).await;
+    create_numbered_table(&ds, &schema, 60).await;
+
+    let sql = select_page_sql(&schema, "t", FETCH_LIMIT as u64, 0);
+    let page = worker::fetch_page(&ds, &sql)
+        .await
+        .expect("fetch_page should succeed");
+    assert_eq!(page.rows.len(), 50);
+    assert!(page.has_next);
+
+    // Deliberately no sleep/yield between fetch_page returning and the next
+    // request: the property under test is that fetch_page's drain loop
+    // releases the connection's single permit synchronously, before it
+    // returns control to the caller -- not eventually, via a background
+    // drain task racing this very call. If the drain-before-drop fix
+    // regressed (e.g. the stream were dropped before being fully drained),
+    // this call would observe DataSourceError::Busy instead.
+    let result = ds.list_tables(&schema).await;
+    assert!(
+        result.is_ok(),
+        "list_tables should succeed immediately after fetch_page returns, proving the \
+         connection's permit was released synchronously rather than deferred to a background \
+         drain task -- got {result:?}"
+    );
+
+    drop_schema(&ds, &schema).await;
+}
+
+#[tokio::test]
+async fn fetch_page_at_exactly_fifty_rows_returns_all_rows_with_no_next_page() {
+    require_pg!();
+    let ds = connect().await;
+    let schema = unique_schema("fetch50");
+    create_schema(&ds, &schema).await;
+    create_numbered_table(&ds, &schema, 50).await;
+
+    let sql = select_page_sql(&schema, "t", FETCH_LIMIT as u64, 0);
+    let page = worker::fetch_page(&ds, &sql)
+        .await
+        .expect("fetch_page should succeed");
+    assert_eq!(page.rows.len(), 50);
+    assert!(!page.has_next);
+
+    drop_schema(&ds, &schema).await;
+}
+
+#[tokio::test]
+async fn fetch_page_at_exactly_fifty_one_rows_truncates_the_fifty_first_row_and_reports_has_next() {
+    require_pg!();
+    let ds = connect().await;
+    let schema = unique_schema("fetch51");
+    create_schema(&ds, &schema).await;
+    create_numbered_table(&ds, &schema, 51).await;
+
+    let sql = select_page_sql(&schema, "t", FETCH_LIMIT as u64, 0);
+    let page = worker::fetch_page(&ds, &sql)
+        .await
+        .expect("fetch_page should succeed");
+    assert_eq!(
+        page.rows.len(),
+        50,
+        "the 51st row must be consumed only to decide has_next, never rendered/returned"
+    );
+    assert!(page.has_next);
+
+    drop_schema(&ds, &schema).await;
+}
+
+#[tokio::test]
+async fn fetch_page_on_an_empty_table_returns_no_rows_but_populated_columns() {
+    require_pg!();
+    let ds = connect().await;
+    let schema = unique_schema("fetch0");
+    create_schema(&ds, &schema).await;
+    create_numbered_table(&ds, &schema, 0).await;
+
+    let sql = select_page_sql(&schema, "t", FETCH_LIMIT as u64, 0);
+    let page = worker::fetch_page(&ds, &sql)
+        .await
+        .expect("fetch_page should succeed");
+    assert!(page.rows.is_empty());
+    assert!(
+        !page.columns.is_empty(),
+        "RowDescription arrives even for a zero-row result, so columns should still be populated"
+    );
+    assert_eq!(page.columns, vec!["n".to_string()]);
+    assert!(!page.has_next);
+
+    drop_schema(&ds, &schema).await;
+}
+
+#[tokio::test]
+async fn fetch_page_second_page_returns_the_remaining_rows_with_no_further_next_page() {
+    require_pg!();
+    let ds = connect().await;
+    let schema = unique_schema("fetchpage2");
+    create_schema(&ds, &schema).await;
+    create_numbered_table(&ds, &schema, 60).await;
+
+    let first_sql = select_page_sql(&schema, "t", FETCH_LIMIT as u64, 0);
+    let first = worker::fetch_page(&ds, &first_sql)
+        .await
+        .expect("fetch_page should succeed for the first page");
+    assert!(first.has_next);
+
+    let second_sql = select_page_sql(&schema, "t", FETCH_LIMIT as u64, 50);
+    let second = worker::fetch_page(&ds, &second_sql)
+        .await
+        .expect("fetch_page should succeed for the second page");
+    assert_eq!(second.rows.len(), 10);
+    assert!(!second.has_next);
+
+    drop_schema(&ds, &schema).await;
+}
+
+#[tokio::test]
+async fn fetch_page_distinguishes_null_from_empty_string_end_to_end() {
+    require_pg!();
+    let ds = connect().await;
+    let schema = unique_schema("fetchnull");
+    create_schema(&ds, &schema).await;
+    let q = quote_ident(&schema);
+
+    exec_to_completion(&ds, &format!("CREATE TABLE {q}.t (id int, s text)"))
+        .await
+        .expect("create table");
+    exec_to_completion(
+        &ds,
+        &format!("INSERT INTO {q}.t (id, s) VALUES (1, NULL), (2, '')"),
+    )
+    .await
+    .expect("insert rows");
+
+    let sql = select_page_sql(&schema, "t", FETCH_LIMIT as u64, 0);
+    let page = worker::fetch_page(&ds, &sql)
+        .await
+        .expect("fetch_page should succeed");
+    assert_eq!(page.rows.len(), 2);
+
+    let id_idx = page
+        .columns
+        .iter()
+        .position(|c| c == "id")
+        .expect("id column should be present");
+    let s_idx = page
+        .columns
+        .iter()
+        .position(|c| c == "s")
+        .expect("s column should be present");
+
+    let row_for = |id: &str| {
+        page.rows
+            .iter()
+            .find(|r| r[id_idx].as_deref() == Some(id))
+            .unwrap_or_else(|| panic!("expected a row with id={id} in {:?}", page.rows))
+    };
+
+    assert_eq!(
+        row_for("1")[s_idx],
+        None,
+        "SQL NULL should round-trip through fetch_page/Page::from_fetched as None"
+    );
+    assert_eq!(
+        row_for("2")[s_idx],
+        Some(String::new()),
+        "an empty string literal should round-trip through fetch_page/Page::from_fetched as \
+         Some(\"\"), not None"
+    );
+
+    drop_schema(&ds, &schema).await;
+}
+
+// Regression test for a bug where fetch_page skipped draining the RowStream
+// when the query itself errored server-side (e.g. division by zero), which
+// left the connection permit stuck in a deferred-release (background drain
+// task) state and caused the very next request on the same connection to
+// spuriously fail with Busy -- destroying the real error message the user
+// should have seen.
+//
+// Note on coverage: a syntax error (e.g. "SELEKT 1", see
+// `syntax_error_surfaces_from_first_next_call_with_an_error_position` above)
+// exercises the *same* fetch_page/RowStream code path as a runtime error
+// like `SELECT 1/0` -- `execute()` returns `Ok(stream)` in both cases (simple
+// query protocol reports errors as a message on the stream, not as a
+// synchronous failure from `simple_query_raw`), and the failure only
+// surfaces once `stream.take()` polls the stream, aborting it. There isn't a
+// reachable case where `source.execute(sql).await?` itself fails with a SQL
+// problem before a stream exists (the only way `execute()` fails
+// synchronously is `Busy`, from a permit already held by a concurrent
+// caller, which is a different scenario already covered by
+// `list_tables_reports_busy_while_a_concurrent_stream_is_held_open` above).
+// So a single runtime-error case here is representative; duplicating it with
+// a syntax-error variant would just restate the same code path.
+#[tokio::test]
+async fn fetch_page_error_does_not_leave_the_connection_busy_for_the_next_request() {
+    require_pg!();
+    let ds = connect().await;
+
+    let result = worker::fetch_page(&ds, "SELECT 1/0").await;
+    match &result {
+        Err(DataSourceError::Query { source, .. }) => {
+            // tokio_postgres::Error's own Display is just "db error" for a
+            // server-reported failure; the real message lives on the
+            // wrapped DbError (same accessor `error_position()` uses).
+            let db_error = source
+                .as_db_error()
+                .expect("a division-by-zero failure should be a DbError");
+            assert!(
+                db_error.message().contains("division by zero"),
+                "expected the real division-by-zero error to surface, got: {}",
+                db_error.message()
+            );
+        }
+        other => panic!(
+            "expected DataSourceError::Query wrapping the division-by-zero error, got {other:?}"
+        ),
+    }
+
+    // Deliberately no sleep/yield between fetch_page returning and this next
+    // call: the property under test is that fetch_page's `stream.finish()`
+    // call drains and releases the connection's single permit synchronously,
+    // within fetch_page's own return -- not eventually, via a background
+    // drain task racing this very call.
+    let schemas = ds.list_schemas().await;
+    assert!(
+        !matches!(schemas, Err(DataSourceError::Busy { .. })),
+        "list_schemas should not observe Busy immediately after a failed fetch_page call -- \
+         that would mean the connection permit was not released synchronously, got {schemas:?}"
+    );
+    assert!(
+        schemas.is_ok(),
+        "list_schemas should succeed immediately after a failed fetch_page call, got {schemas:?}"
+    );
 }

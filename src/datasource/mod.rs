@@ -2,7 +2,7 @@ mod introspect;
 mod postgres;
 mod stream;
 
-pub use postgres::{ConnectOptions, PostgresDataSource, quote_ident};
+pub use postgres::{ConnectOptions, PostgresDataSource, quote_ident, select_page_sql};
 pub use stream::{Row, RowStream};
 
 #[async_trait::async_trait]

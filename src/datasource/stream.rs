@@ -151,6 +151,39 @@ impl RowStream {
         Ok(rows)
     }
 
+    /// Ensures the stream is fully drained (or was already aborted by an
+    /// error) so that dropping it takes the synchronous permit-release path
+    /// (`Drop`'s `Ended` fast path) instead of deferring to a background
+    /// drain task. Call this before dropping a stream you're done with, on
+    /// EVERY code path (success AND error) — an aborted stream still needs
+    /// its remaining wire bytes discarded before the connection is reusable,
+    /// and `next()` alone can't do that once `state` is `Aborted`: it
+    /// short-circuits straight to `None` without ever touching `self.inner`
+    /// again.
+    pub async fn finish(&mut self) {
+        use futures_util::StreamExt;
+
+        if matches!(
+            self.state,
+            StreamState::Streaming | StreamState::AfterComplete
+        ) {
+            while self.next().await.is_some() {}
+        }
+        if matches!(self.state, StreamState::Aborted) {
+            // Not fused: a closed connection keeps yielding Err forever, so
+            // this break is load-bearing (without it, this spins at 100% CPU
+            // and never returns, stalling the whole tokio runtime — see the
+            // identical hazard/fix in postgres.rs's drain_abandoned).
+            while let Some(item) = self.inner.next().await {
+                if item.is_err() {
+                    break;
+                }
+            }
+            self.state = StreamState::Ended;
+            self.clear_active();
+        }
+    }
+
     fn clear_active(&self) {
         let _ = self.active_id.compare_exchange(
             self.query_id.0,
@@ -432,6 +465,133 @@ mod tests {
             after.is_none(),
             "polling an Aborted stream must return None, not loop or re-return the error, got {after:?}"
         );
+    }
+
+    // finish() must drain a Streaming stream all the way to Ended (and clear
+    // active_id) even when the caller stopped short of Complete/None itself
+    // -- this is the success-path half of the drain-before-drop invariant
+    // that fetch_page relies on.
+    #[tokio::test]
+    async fn finish_drains_remaining_messages_from_streaming_and_reaches_ended() {
+        let active_id = Arc::new(AtomicU64::new(11));
+        let mut rs = test_row_stream(
+            Arc::clone(&active_id),
+            11,
+            vec![
+                Ok(ResultMessage::Columns(Arc::from(vec!["a".to_string()]))),
+                Ok(ResultMessage::Row(vec![Some("1".to_string())])),
+                Ok(ResultMessage::Complete { rows_affected: 1 }),
+            ],
+            StreamState::Streaming,
+        );
+
+        rs.finish().await;
+
+        assert_eq!(rs.state, StreamState::Ended);
+        assert_eq!(active_id.load(Ordering::Acquire), 0);
+    }
+
+    // AfterComplete with nothing left on the wire (the common single-
+    // statement case): finish() must reach Ended via the plain `next()`
+    // drain loop, without ever falling into the Aborted branch.
+    #[tokio::test]
+    async fn finish_from_after_complete_with_no_more_messages_reaches_ended() {
+        let active_id = Arc::new(AtomicU64::new(12));
+        let mut rs = test_row_stream(
+            Arc::clone(&active_id),
+            12,
+            vec![],
+            StreamState::AfterComplete,
+        );
+
+        rs.finish().await;
+
+        assert_eq!(rs.state, StreamState::Ended);
+        assert_eq!(active_id.load(Ordering::Acquire), 0);
+    }
+
+    // The specific case the doc comment on finish() calls out: once state is
+    // Aborted, next() short-circuits straight to None without ever touching
+    // self.inner again, so finish() must fall back to draining self.inner
+    // directly to discard the remaining wire bytes and clear active_id. This
+    // is the error-path half of the drain-before-drop invariant (e.g. a
+    // query that failed mid-stream, like `SELECT 1/0`).
+    #[tokio::test]
+    async fn finish_from_aborted_drains_remaining_wire_bytes_and_reaches_ended() {
+        let active_id = Arc::new(AtomicU64::new(13));
+        let mut rs = test_row_stream(
+            Arc::clone(&active_id),
+            13,
+            vec![
+                Ok(ResultMessage::Row(vec![Some("leftover".to_string())])),
+                Ok(ResultMessage::Complete { rows_affected: 0 }),
+            ],
+            StreamState::Aborted,
+        );
+
+        rs.finish().await;
+
+        assert_eq!(rs.state, StreamState::Ended);
+        assert_eq!(
+            active_id.load(Ordering::Acquire),
+            0,
+            "finish() must clear active_id even when starting from Aborted, since next() alone \
+             short-circuits to None without ever touching self.inner again once state is Aborted"
+        );
+    }
+
+    // Calling finish() on an already-Ended stream (e.g. a caller that fully
+    // drained via next() itself before calling finish() defensively) must be
+    // a no-op: neither branch should fire, and active_id must not be
+    // clobbered by a stale compare_exchange.
+    #[tokio::test]
+    async fn finish_on_an_already_ended_stream_is_a_no_op() {
+        let active_id = Arc::new(AtomicU64::new(14));
+        let mut rs = test_row_stream(Arc::clone(&active_id), 14, vec![], StreamState::Ended);
+
+        rs.finish().await;
+
+        assert_eq!(rs.state, StreamState::Ended);
+        assert_eq!(
+            active_id.load(Ordering::Acquire),
+            14,
+            "finish() on an already-Ended stream must not touch active_id"
+        );
+    }
+
+    // Regression test for the infinite-loop bug: once state is Aborted, a
+    // dead connection's underlying stream is not fused and yields Err on
+    // every single poll forever (never Pending, never None). finish()'s
+    // Aborted-branch drain loop must break on the first Err instead of
+    // looping on `.is_some()` (which is true for Some(Err) too), or this
+    // spins at 100% CPU and never returns. The whole test is wrapped in a
+    // timeout so a regression fails the suite instead of hanging it.
+    #[tokio::test]
+    async fn finish_from_aborted_breaks_on_a_stream_that_yields_err_forever() {
+        let active_id = Arc::new(AtomicU64::new(20));
+        let permit = std::sync::Arc::new(Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("fresh semaphore has a free permit");
+        let mut rs = RowStream {
+            inner: Box::pin(stream::repeat_with(|| Err(DataSourceError::Cancelled))),
+            query_id: QueryId(20),
+            columns: None,
+            rows_affected: None,
+            active_id: Arc::clone(&active_id),
+            permit: Some(permit),
+            abandon: None,
+            state: StreamState::Aborted,
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), rs.finish())
+            .await
+            .expect(
+                "finish() must return promptly even when the inner stream yields Err on every \
+                 poll forever, not spin at 100% CPU indefinitely",
+            );
+
+        assert_eq!(rs.state, StreamState::Ended);
+        assert_eq!(active_id.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]

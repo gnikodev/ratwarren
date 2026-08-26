@@ -1,4 +1,21 @@
+pub mod grid;
 pub mod tree;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RequestId(pub u64);
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum Load<T> {
+    #[default]
+    NotLoaded,
+    Loading {
+        id: RequestId,
+    },
+    Loaded(T),
+    Failed {
+        message: String,
+    },
+}
 
 pub fn error_chain(err: &dyn std::error::Error) -> String {
     let mut message = err.to_string();

@@ -1,7 +1,6 @@
 use crate::datasource::{Column, DataSourceError, Schema, Table};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RequestId(pub u64);
+pub use crate::ui::RequestId;
 
 #[derive(Debug)]
 pub enum TreeRequest {

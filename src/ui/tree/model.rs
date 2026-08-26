@@ -1,5 +1,6 @@
 use crate::datasource::{Column, Schema, Table};
-use crate::ui::tree::message::RequestId;
+
+pub use crate::ui::Load;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NodeKey {
@@ -14,19 +15,6 @@ pub enum NodeKey {
         schema: String,
         table: String,
         column: String,
-    },
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub enum Load<T> {
-    #[default]
-    NotLoaded,
-    Loading {
-        id: RequestId,
-    },
-    Loaded(T),
-    Failed {
-        message: String,
     },
 }
 

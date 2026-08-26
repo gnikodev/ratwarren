@@ -527,6 +527,14 @@ fn map_query_error(sql: &str, source: tokio_postgres::Error) -> DataSourceError 
     }
 }
 
+pub fn select_page_sql(schema: &str, table: &str, limit: u64, offset: u64) -> String {
+    format!(
+        "SELECT * FROM {}.{} LIMIT {limit} OFFSET {offset}",
+        quote_ident(schema),
+        quote_ident(table)
+    )
+}
+
 pub fn quote_ident(ident: &str) -> String {
     let mut quoted = String::with_capacity(ident.len() + 2);
     quoted.push('"');
@@ -557,6 +565,21 @@ mod tests {
     #[test]
     fn quote_ident_handles_empty_string() {
         assert_eq!(quote_ident(""), "\"\"");
+    }
+
+    #[test]
+    fn select_page_sql_quotes_identifiers_needing_quoting_and_composes_limit_offset() {
+        let sql = select_page_sql("my schema", "my.table\"name", 51, 100);
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"my schema\".\"my.table\"\"name\" LIMIT 51 OFFSET 100"
+        );
+    }
+
+    #[test]
+    fn select_page_sql_with_plain_identifiers() {
+        let sql = select_page_sql("public", "users", 51, 0);
+        assert_eq!(sql, "SELECT * FROM \"public\".\"users\" LIMIT 51 OFFSET 0");
     }
 
     // Synthetic (no real Postgres) concurrency regression test for the
