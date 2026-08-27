@@ -7,10 +7,10 @@ public internet.
 Written in Rust with [ratatui](https://ratatui.rs). Inspired by the
 `lazy*` family of tools (lazygit, lazydocker), but for SQL.
 
-> **Status: early development, not usable yet.** This repository currently
-> contains only planning documentation. Implementation follows the roadmap
-> in [docs/ROADMAP.md](docs/ROADMAP.md), starting with a single-driver
-> Postgres MVP.
+> **Status: MVP0 implemented, not yet dogfooded.** All MVP0 phases in
+> [docs/MVP0-PLAN.md](docs/MVP0-PLAN.md) are built and tested; a real
+> session against a personal VPS is the last outstanding step. See
+> [docs/ROADMAP.md](docs/ROADMAP.md) for what comes after MVP0.
 
 ## Why
 
@@ -33,12 +33,59 @@ ratwarren is built around three things at once:
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the technical design
 and [docs/ROADMAP.md](docs/ROADMAP.md) for the MVP plan.
 
+## Getting started
+
+For the full picture — every config field, SSH tunnel setup, every
+keybinding, and current limitations — see
+[docs/USER-GUIDE.md](docs/USER-GUIDE.md). The short version:
+
+1. Build it: `cargo build --release`. Use `target/release/ratwarren` from
+   here on, not `cargo run` — see the Keychain note below for why.
+2. Run it once with no config to find out where it expects one:
+   ```sh
+   ratwarren
+   ```
+   With nothing configured yet, it prints the exact config file path for
+   your platform (see below) and exits — it never guesses or creates the
+   file for you.
+3. Create that file with at least one connection:
+   ```toml
+   [[connections]]
+   name = "prod"
+   host = "127.0.0.1"    # or a bastion-local address if using an SSH tunnel below
+   database = "app"
+   user = "app"
+
+   [connections.password]
+   source = "keyring"    # omit this whole table entirely for passwordless/peer auth
+   ```
+   Add an `[connections.tunnel]` table (`host`, optionally `user`/`port`) if
+   the database is only reachable through an SSH bastion — see
+   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the tunnel model.
+4. If you added a `[connections.password]` table, store the actual secret
+   (see "Configuration and secrets" below) before connecting — otherwise
+   the database will simply reject the connection with a
+   "password missing"/"password authentication failed" error.
+5. Connect:
+   ```sh
+   ratwarren prod          # explicit connection name
+   ratwarren                # works too if you only have one connection configured
+   ```
+   With more than one connection and no name given, ratwarren lists the
+   configured names and exits instead of guessing which one you meant.
+
 ## Configuration and secrets
 
 Connections live in a plain TOML config file at your platform's standard
-config directory (e.g. `~/.config/ratwarren/config.toml` on Linux,
-`~/Library/Application Support/ratwarren/config.toml` on macOS). ratwarren
-prints the exact path itself if you run it before adding any connections.
+config directory — not your home directory directly, but the OS-standard
+per-app location, exactly like most native macOS/Linux/Windows apps use
+(`~/.config/ratwarren/config.toml` on Linux,
+`~/Library/Application Support/ratwarren/config.toml` on macOS,
+`%APPDATA%\ratwarren\config.toml` on Windows). ratwarren prints the exact
+path itself if you run it before adding any connections — you never need to
+guess it or hardcode it. If you'd rather keep the file somewhere else
+entirely, set `RATWARREN_CONFIG=/path/to/config.toml` to override the
+location outright.
 
 Passwords are never stored in that file. A connection opts into a password
 by adding a `[connections.password]` table with `source = "keyring"`, and
