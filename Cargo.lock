@@ -1346,6 +1346,7 @@ dependencies = [
  "futures-util",
  "ratatui",
  "serde",
+ "sqlparser",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -1566,6 +1567,15 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys",
+]
+
+[[package]]
+name = "sqlparser"
+version = "0.62.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13c6d1b651dc4edf07eead2a0c6c78016ce971bc2c10da5266861b13f25e7cec"
+dependencies = [
+ "log",
 ]
 
 [[package]]

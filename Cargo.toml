@@ -17,6 +17,12 @@ tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "ti
 tokio-postgres = "=0.7.18"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 async-trait = "0.1"
+# Exact pin: split.rs's statement splitting depends on Span::end being
+# EXCLUSIVE, verified empirically against this exact version (a probe binary
+# tokenizing "SELECT" gives span (1,1)..(1,7)). The crate's own doc comment on
+# Span::end says "inclusive", which is wrong — that's an unwritten contract we
+# can't rely on surviving a future upgrade without re-verifying.
+sqlparser = { version = "=0.62.0", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"
