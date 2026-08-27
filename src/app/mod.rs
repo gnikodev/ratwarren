@@ -10,7 +10,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Paragraph};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::datasource::QueryId;
 use crate::editor::{Motion, RunTarget};
 use crate::ui::editor::EditorState;
 use crate::ui::editor::widget::EditorWidget;
@@ -21,7 +20,7 @@ use crate::ui::tree::state::{ObjectTreeState, TreeCommand, TreeRowKey};
 use crate::ui::tree::widget::ObjectTreeWidget;
 use keymap::{AppCommand, RunKey, map_key};
 use message::{WorkerRequest, WorkerResponse};
-use run::{RunOutcome, RunState, RunSummary};
+use run::{CancelOutcome, CancelRequest, RunOutcome, RunState, RunSummary};
 use status::{Status, StatusKind};
 
 const TREE_FOOTER: &str =
@@ -46,7 +45,7 @@ pub struct App {
     focus: Focus,
     requests: UnboundedSender<WorkerRequest>,
     responses: UnboundedReceiver<WorkerResponse>,
-    cancels: UnboundedSender<QueryId>,
+    cancels: UnboundedSender<CancelRequest>,
     connection_name: String,
     should_quit: bool,
 }
@@ -56,7 +55,7 @@ impl App {
         connection_name: String,
         requests: UnboundedSender<WorkerRequest>,
         responses: UnboundedReceiver<WorkerResponse>,
-        cancels: UnboundedSender<QueryId>,
+        cancels: UnboundedSender<CancelRequest>,
     ) -> Self {
         Self {
             tree: ObjectTreeState::new(),
@@ -147,8 +146,8 @@ impl App {
                 self.start_run(target);
             }
             Some(AppCommand::CancelOrQuit) => match self.run.request_cancel() {
-                Some(qid) => {
-                    let _ = self.cancels.send(qid);
+                Some(req) => {
+                    let _ = self.cancels.send(req);
                     self.status = Some(Status::info("cancelling…"));
                 }
                 None if self.run.is_active() => {
@@ -188,15 +187,15 @@ impl App {
         use run::QueryResponse;
         match r {
             QueryResponse::Started { id, query_id } => {
-                if let Some(qid) = self.run.on_started(id, query_id) {
-                    let _ = self.cancels.send(qid);
+                if let Some(req) = self.run.on_started(id, query_id) {
+                    let _ = self.cancels.send(req);
                 }
             }
             QueryResponse::Finished { id, result } => {
                 if !self.run.owns(id) {
                     return;
                 }
-                self.grid.finish_query(id, result.as_ref());
+                let displayed = self.grid.finish_query(id, result.as_ref());
                 if let Err(e) = &result
                     && let Some(unit) = self.run.current().cloned()
                 {
@@ -204,18 +203,31 @@ impl App {
                 }
                 match self.run.on_finished(id, &result) {
                     Some(RunOutcome::Next(req)) => {
+                        // No `displayed`-driven note here (unlike the `Done`
+                        // branch below): `begin_query` unconditionally moves
+                        // the grid onto this next statement's loading state
+                        // regardless of `displayed`, so a "result not shown
+                        // (grid moved on)" note would be backwards here -- it
+                        // would describe the grid as having stayed on a table
+                        // view it is, in this very branch, about to clobber.
                         self.grid.begin_query(req.id, title_of(&req.sql));
                         let _ = self.requests.send(WorkerRequest::Query(req));
                         self.status = Some(running_status(&self.run));
                     }
                     Some(RunOutcome::Done(summary)) => {
-                        self.status = Some(summary_status(&summary));
+                        let mut status = summary_status(&summary);
+                        if !displayed {
+                            status.text.push_str(" · result not shown (grid moved on)");
+                        }
+                        self.status = Some(status);
                     }
                     None => {}
                 }
             }
-            QueryResponse::CancelFailed { message } => {
-                self.status = Some(Status::error(message));
+            QueryResponse::CancelFailed { id, message } => {
+                if self.run.owns(id) {
+                    self.status = Some(Status::error(message));
+                }
             }
         }
     }
@@ -304,6 +316,7 @@ impl App {
                 let style = match status.kind {
                     StatusKind::Info => Style::default(),
                     StatusKind::Error => Style::default().fg(Color::Red),
+                    StatusKind::Warn => Style::default().fg(Color::Yellow),
                 };
                 let footer = Paragraph::new(status.text.clone()).style(style);
                 frame.render_widget(footer, chunks[1]);
@@ -359,23 +372,38 @@ fn running_status(run: &RunState) -> Status {
 }
 
 fn summary_status(summary: &RunSummary) -> Status {
-    if summary.cancelled {
-        Status::info(format!(
-            "cancelled at statement {} of {}",
+    match summary.cancelled {
+        Some(CancelOutcome::Interrupted) => Status::info(format!(
+            "cancelled — statement {} of {} interrupted",
             summary.ran, summary.total
-        ))
-    } else if let Some(err) = &summary.failed {
-        Status::error(format!(
-            "statement {} of {} failed: {}",
-            summary.ran, summary.total, err
-        ))
-    } else if let Some(n) = summary.last_affected {
-        Status::info(format!(
-            "ran {} of {} · {n} rows affected",
+        )),
+        Some(CancelOutcome::CompletedFirst) if summary.ran < summary.total => {
+            Status::warn(format!(
+                "cancel came too late — statement {} of {} completed; stopped before statement {}",
+                summary.ran,
+                summary.total,
+                summary.ran + 1
+            ))
+        }
+        Some(CancelOutcome::CompletedFirst) => Status::warn(format!(
+            "cancel came too late — statement {} of {} completed",
             summary.ran, summary.total
-        ))
-    } else {
-        Status::info(format!("ran {} of {}", summary.ran, summary.total))
+        )),
+        None => {
+            if let Some(err) = &summary.failed {
+                Status::error(format!(
+                    "statement {} of {} failed: {}",
+                    summary.ran, summary.total, err
+                ))
+            } else if let Some(n) = summary.last_affected {
+                Status::info(format!(
+                    "ran {} of {} · {n} rows affected",
+                    summary.ran, summary.total
+                ))
+            } else {
+                Status::info(format!("ran {} of {}", summary.ran, summary.total))
+            }
+        }
     }
 }
 
@@ -432,7 +460,7 @@ mod tests {
     fn new_app() -> (
         App,
         UnboundedReceiver<WorkerRequest>,
-        UnboundedReceiver<QueryId>,
+        UnboundedReceiver<CancelRequest>,
     ) {
         let (req_tx, req_rx) = unbounded_channel();
         let (_resp_tx, resp_rx) = unbounded_channel();
@@ -618,6 +646,208 @@ mod tests {
                 "a DataSourceError with no error_position() must never move the cursor"
             );
         }
+    }
+
+    fn summary(ran: usize, total: usize, cancelled: Option<CancelOutcome>) -> RunSummary {
+        RunSummary {
+            ran,
+            total,
+            last_affected: None,
+            failed: None,
+            cancelled,
+        }
+    }
+
+    #[test]
+    fn summary_status_completed_first_not_the_last_statement_names_the_statement_it_stopped_before()
+    {
+        let s = summary(1, 3, Some(CancelOutcome::CompletedFirst));
+        let status = summary_status(&s);
+        assert_eq!(status.kind, StatusKind::Warn);
+        assert_eq!(
+            status.text,
+            "cancel came too late — statement 1 of 3 completed; stopped before statement 2"
+        );
+    }
+
+    #[test]
+    fn summary_status_completed_first_on_the_last_statement_has_no_stopped_before_clause() {
+        let s = summary(3, 3, Some(CancelOutcome::CompletedFirst));
+        let status = summary_status(&s);
+        assert_eq!(
+            status.text,
+            "cancel came too late — statement 3 of 3 completed"
+        );
+        assert!(!status.text.contains("stopped before"));
+    }
+
+    #[test]
+    fn summary_status_distinguishes_an_interrupted_cancel_from_one_that_completed_first() {
+        // Phase 8's whole point for `CancelOutcome`: a cancel that actually
+        // aborted the statement must read differently from one that arrived
+        // after the statement already committed, so a user doesn't assume a
+        // completed DELETE was rolled back.
+        let interrupted = summary(2, 3, Some(CancelOutcome::Interrupted));
+        let completed_first = summary(2, 3, Some(CancelOutcome::CompletedFirst));
+        let interrupted_text = summary_status(&interrupted).text;
+        let completed_first_text = summary_status(&completed_first).text;
+        assert_ne!(interrupted_text, completed_first_text);
+        assert!(interrupted_text.contains("interrupted"));
+        assert!(completed_first_text.contains("completed"));
+    }
+
+    #[test]
+    fn summary_status_with_no_cancel_and_no_failure_reports_a_plain_completion() {
+        let s = summary(2, 2, None);
+        let status = summary_status(&s);
+        assert_eq!(status.kind, StatusKind::Info);
+        assert_eq!(status.text, "ran 2 of 2");
+    }
+
+    #[test]
+    fn stale_cancel_failed_from_a_finished_run_is_ignored_and_does_not_clobber_a_new_runs_status() {
+        let (mut app, mut req_rx, _cancel_rx) = new_app();
+        *app.editor.buffer_mut() = crate::editor::TextBuffer::from_text("SELECT 1;");
+        app.start_run(RunTarget::Buffer);
+        let req1 = match req_rx.try_recv().expect("start_run must send a request") {
+            WorkerRequest::Query(req) => req,
+            WorkerRequest::Tree(_) | WorkerRequest::Grid(_) => panic!("expected a Query request"),
+        };
+
+        // The run finishes (successfully) -- `req1.id` is no longer owned by
+        // `self.run` once this returns.
+        app.apply(WorkerResponse::Query(run::QueryResponse::Finished {
+            id: req1.id,
+            result: Ok(run::QueryOutcome::NoResultSet { rows_affected: 0 }),
+        }));
+        assert!(!app.run.is_active(), "test setup: the run must have ended");
+        let summary_text = app
+            .status
+            .as_ref()
+            .expect("the finished run must have set a summary status")
+            .text
+            .clone();
+
+        // A `CancelFailed` for that same (now stale) request id arrives late,
+        // e.g. from a cancel that was in flight against the transport when
+        // the run ended.
+        app.apply(WorkerResponse::Query(run::QueryResponse::CancelFailed {
+            id: req1.id,
+            message: "stale transport failure".to_string(),
+        }));
+        assert_eq!(
+            app.status.as_ref().map(|s| s.text.clone()),
+            Some(summary_text),
+            "a CancelFailed for a request id the run no longer owns must not overwrite the status"
+        );
+
+        // Start a brand-new run (mints a fresh RequestId) and confirm the
+        // stale CancelFailed doesn't resurface / clobber it either.
+        *app.editor.buffer_mut() = crate::editor::TextBuffer::from_text("SELECT 2;");
+        app.start_run(RunTarget::Buffer);
+        let running_text = app
+            .status
+            .as_ref()
+            .expect("starting the new run must set a running status")
+            .text
+            .clone();
+        assert!(running_text.contains("running"));
+
+        app.apply(WorkerResponse::Query(run::QueryResponse::CancelFailed {
+            id: req1.id,
+            message: "stale transport failure".to_string(),
+        }));
+        assert_eq!(
+            app.status.as_ref().map(|s| s.text.clone()),
+            Some(running_text),
+            "the stale CancelFailed must not clobber the new run's status, since `run.owns(id)` \
+             is false for the old id once a new run has started"
+        );
+    }
+
+    #[test]
+    fn intermediate_statement_finishing_does_not_append_a_misleading_grid_moved_on_note() {
+        // If a table is opened mid-run (origin diverges from `Query`) and an
+        // *intermediate* statement's result then arrives, the `Next` branch
+        // of `apply_query_response` unconditionally calls `begin_query` for
+        // the next statement -- which immediately reclaims the grid from
+        // whatever table view the user opened. A "result not shown (grid
+        // moved on)" note in that branch would therefore be backwards: the
+        // grid didn't stay moved onto the table, it just got yanked back
+        // onto the run. So this branch must never append that note; it's
+        // only accurate in the `Done` branch, where nothing subsequent
+        // re-claims the grid (see the sibling test below for that case).
+        let (mut app, mut req_rx, _cancel_rx) = new_app();
+        *app.editor.buffer_mut() = crate::editor::TextBuffer::from_text("SELECT 1; SELECT 2;");
+        app.start_run(RunTarget::Buffer);
+        let req1 = match req_rx.try_recv().expect("start_run must send a request") {
+            WorkerRequest::Query(req) => req,
+            WorkerRequest::Tree(_) | WorkerRequest::Grid(_) => panic!("expected a Query request"),
+        };
+        assert!(
+            app.grid.is_open(),
+            "test setup: begin_query must open the grid"
+        );
+
+        // Simulate the user opening a table-browse view mid-run -- the same
+        // `DataGridState::open` call `App::activate` makes -- which switches
+        // the grid's origin away from `Query`.
+        let _ = app.grid.open("public".to_string(), "t".to_string());
+
+        app.apply(WorkerResponse::Query(run::QueryResponse::Finished {
+            id: req1.id,
+            result: Ok(run::QueryOutcome::NoResultSet { rows_affected: 0 }),
+        }));
+
+        let status = app
+            .status
+            .as_ref()
+            .expect("advancing to the next statement must set a status");
+        assert!(
+            !status.text.contains("grid moved on"),
+            "an intermediate statement's discarded result must not claim the grid \"moved on\" \
+             when this very branch is about to reclaim the grid for the next statement, got {:?}",
+            status.text
+        );
+        assert!(
+            matches!(
+                app.grid.origin(),
+                Some(crate::ui::grid::state::GridOrigin::Query { .. })
+            ),
+            "test setup sanity: begin_query for statement 2 must have reclaimed the grid"
+        );
+    }
+
+    #[test]
+    fn grid_moved_on_note_is_appended_when_the_final_statements_result_is_discarded() {
+        let (mut app, mut req_rx, _cancel_rx) = new_app();
+        *app.editor.buffer_mut() = crate::editor::TextBuffer::from_text("SELECT 1;");
+        app.start_run(RunTarget::Buffer);
+        let req1 = match req_rx.try_recv().expect("start_run must send a request") {
+            WorkerRequest::Query(req) => req,
+            WorkerRequest::Tree(_) | WorkerRequest::Grid(_) => panic!("expected a Query request"),
+        };
+        assert!(
+            app.grid.is_open(),
+            "test setup: begin_query must open the grid"
+        );
+
+        let _ = app.grid.open("public".to_string(), "t".to_string());
+
+        app.apply(WorkerResponse::Query(run::QueryResponse::Finished {
+            id: req1.id,
+            result: Ok(run::QueryOutcome::NoResultSet { rows_affected: 0 }),
+        }));
+
+        let status = app
+            .status
+            .as_ref()
+            .expect("the final statement finishing must set a summary status");
+        assert!(
+            status.text.contains("· result not shown (grid moved on)"),
+            "the final statement's discarded result must be noted in the status, got {:?}",
+            status.text
+        );
     }
 
     fn unit_at(sql: &str, start: usize) -> crate::editor::RunUnit {

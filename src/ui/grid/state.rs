@@ -105,12 +105,12 @@ impl DataGridState {
         &mut self,
         id: crate::ui::RequestId,
         result: Result<&crate::app::run::QueryOutcome, &crate::datasource::DataSourceError>,
-    ) {
+    ) -> bool {
         if !matches!(&self.content, Load::Loading { id: current } if *current == id) {
-            return;
+            return false;
         }
         if !matches!(self.origin, Some(GridOrigin::Query { .. })) {
-            return;
+            return false;
         }
 
         match result {
@@ -131,6 +131,7 @@ impl DataGridState {
                 };
             }
         }
+        true
     }
 
     pub fn command(&mut self, cmd: GridCommand) -> Option<GridRequest> {
@@ -576,7 +577,11 @@ mod tests {
         let id = crate::ui::RequestId(1);
         state.begin_query(id, "SELECT 1".into());
         let outcome = QueryOutcome::Rows(page_with_rows(2));
-        state.finish_query(id, Ok(&outcome));
+        let displayed = state.finish_query(id, Ok(&outcome));
+        assert!(
+            displayed,
+            "a matching id and Query origin must report the result as displayed"
+        );
         assert!(matches!(
             state.content(),
             Load::Loaded(GridContent::Rows(_))
@@ -590,12 +595,29 @@ mod tests {
         let id = crate::ui::RequestId(1);
         state.begin_query(id, "UPDATE t SET x = 1".into());
         let outcome = QueryOutcome::NoResultSet { rows_affected: 5 };
-        state.finish_query(id, Ok(&outcome));
+        let displayed = state.finish_query(id, Ok(&outcome));
+        assert!(displayed);
         assert!(matches!(
             state.content(),
             Load::Loaded(GridContent::NoResultSet { rows_affected: 5 })
         ));
         assert_eq!(state.table_state_mut().selected(), None);
+    }
+
+    #[test]
+    fn finish_query_reports_an_error_result_as_displayed_too() {
+        // An error is still "displayed" (as Load::Failed) rather than
+        // discarded -- only a stale id / mismatched origin makes it not
+        // displayed, not the Ok/Err split of the result itself.
+        let mut state = DataGridState::new();
+        let id = crate::ui::RequestId(1);
+        state.begin_query(id, "SELECT 1 / 0".into());
+        let displayed = state.finish_query(id, Err(&DataSourceError::Cancelled));
+        assert!(
+            displayed,
+            "an error result for a matching id/origin must be reported as displayed"
+        );
+        assert!(matches!(state.content(), Load::Failed { .. }));
     }
 
     #[test]
@@ -606,7 +628,11 @@ mod tests {
         let id2 = crate::ui::RequestId(2);
         state.begin_query(id2, "SELECT 2".into());
         let outcome = QueryOutcome::NoResultSet { rows_affected: 0 };
-        state.finish_query(id1, Ok(&outcome));
+        let displayed = state.finish_query(id1, Ok(&outcome));
+        assert!(
+            !displayed,
+            "a stale request id must not be reported as displayed"
+        );
         assert!(matches!(state.content(), Load::Loading { id } if *id == id2));
     }
 
@@ -628,8 +654,37 @@ mod tests {
             schema: "public".into(),
             table: "t".into(),
         });
-        state.finish_query(id, Ok(&outcome));
+        let displayed = state.finish_query(id, Ok(&outcome));
+        assert!(
+            !displayed,
+            "a Query result arriving after the origin switched to Table must not be reported as \
+             displayed"
+        );
         assert!(matches!(state.content(), Load::Loading { .. }));
+    }
+
+    #[test]
+    fn finish_query_never_overwrites_already_visible_table_rows_with_a_stale_query_result() {
+        // The concrete safety property behind the bool return: once the grid
+        // is genuinely showing table data (not just mid-request), a late
+        // query result must leave that data completely untouched, not just
+        // report `false`.
+        let mut state = DataGridState::new();
+        let table_page = page_with_rows(3);
+        open_and_load(&mut state, table_page.clone());
+        assert!(matches!(
+            state.content(),
+            Load::Loaded(GridContent::Rows(p)) if *p == table_page
+        ));
+
+        let outcome = QueryOutcome::NoResultSet { rows_affected: 999 };
+        let displayed = state.finish_query(crate::ui::RequestId(0), Ok(&outcome));
+        assert!(!displayed);
+        assert!(
+            matches!(state.content(), Load::Loaded(GridContent::Rows(p)) if *p == table_page),
+            "the visible table rows must be unchanged by the discarded query result, got {:?}",
+            state.content()
+        );
     }
 
     #[test]

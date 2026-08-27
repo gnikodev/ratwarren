@@ -288,6 +288,14 @@ impl Tunnel {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
+            // why: the ssh child (and anything its ~/.ssh/config tells it to
+            // exec, e.g. a ProxyCommand/Match-exec/LocalCommand) must never
+            // see the DB password `secret::resolve` already put in this
+            // process's environment for connecting to Postgres -- it has no
+            // legitimate use for it, and ratwarren can't vet what a
+            // ProxyCommand does with its environment (log it, crash-dump it,
+            // etc).
+            .env_remove(crate::secret::PASSWORD_ENV_VAR)
             .spawn()
             .map_err(|source| TunnelError::Spawn {
                 program: options.ssh_program.clone(),

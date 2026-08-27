@@ -13,6 +13,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use ratwarren::config::SshTunnel;
+use ratwarren::secret::PASSWORD_ENV_VAR;
 use ratwarren::tunnel::{Tunnel, TunnelError, TunnelOptions, TunnelSpec};
 
 // Every test in this file binds/holds ephemeral 127.0.0.1 ports and/or
@@ -135,6 +136,56 @@ fn spawn_delivers_argv_to_the_child_process_unmangled() {
     );
 
     tunnel.shutdown();
+}
+
+#[test]
+fn spawned_ssh_child_never_sees_ratwarren_password() {
+    let _guard = serialize_port_test();
+    // Every other test in this file is serialized behind the same lock, so
+    // this is the only test able to observe/mutate the process-wide
+    // environment while it does so -- required since std::env::set_var
+    // affects the whole process, not just this thread.
+    // Safety: no other thread reads/writes process env concurrently here,
+    // guaranteed by `serialize_port_test`'s exclusive lock over this whole
+    // file's test suite.
+    unsafe {
+        std::env::set_var(PASSWORD_ENV_VAR, "super-secret-db-password");
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir creation");
+    let out_path = dir.path().join("env.out");
+    let stub = write_stub(
+        dir.path(),
+        "ssh-dump-env.sh",
+        &format!("#!/bin/sh\nenv > {}\nexec sleep 30\n", out_path.display()),
+    );
+
+    let spec = test_spec();
+    let options = fast_options(stub);
+    let local_port = reserve_port();
+
+    let tunnel =
+        Tunnel::spawn_at(&spec, &options, local_port).expect("spawning the stub should succeed");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let observed = loop {
+        let observed = fs::read_to_string(&out_path).unwrap_or_default();
+        if !observed.is_empty() || Instant::now() >= deadline {
+            break observed;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    tunnel.shutdown();
+    // Safety: same single-threaded-w.r.t.-env guarantee as the set_var above.
+    unsafe {
+        std::env::remove_var(PASSWORD_ENV_VAR);
+    }
+
+    assert!(
+        !observed.contains(PASSWORD_ENV_VAR),
+        "the spawned ssh child's environment must not contain {PASSWORD_ENV_VAR}, got:\n{observed}"
+    );
 }
 
 #[test]

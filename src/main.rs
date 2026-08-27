@@ -2,11 +2,28 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use ratwarren::app::{self, App};
+use ratwarren::cli::{self, Invocation};
 use ratwarren::config::Config;
 use ratwarren::datasource::{DataSource, PostgresDataSource};
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    match cli::parse_args(std::env::args()) {
+        Invocation::Help => {
+            println!("{}", cli::USAGE);
+            ExitCode::SUCCESS
+        }
+        Invocation::BadUsage(msg) => {
+            eprintln!("{msg}");
+            eprintln!("{}", cli::USAGE);
+            ExitCode::from(2)
+        }
+        Invocation::SetPassword { name } => set_password(&name),
+        Invocation::Run { name } => run(name).await,
+    }
+}
+
+async fn run(name: Option<String>) -> ExitCode {
     let config = match Config::load() {
         Ok(config) => config,
         Err(e) => {
@@ -15,7 +32,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    let name = match pick_connection(&config) {
+    let name = match pick_connection(&config, name) {
         Ok(name) => name,
         Err(code) => return code,
     };
@@ -23,17 +40,18 @@ async fn main() -> ExitCode {
         .connection(&name)
         .expect("pick_connection only returns names present in config");
 
-    let password = std::env::var("RATWARREN_PASSWORD").ok();
-    if conn.password.is_some() && password.is_none() {
-        eprintln!(
-            "note: connection {name:?} has a keyring password configured, but keyring-based \
-             secret resolution isn't wired up until Phase 8 — set RATWARREN_PASSWORD in the \
-             environment to supply the password for now."
-        );
+    // Must happen before ratatui::init(): a blocking keyring call and any
+    // stderr note it prints need the primary screen -- doing this inside the
+    // tokio event loop (after the terminal is in alternate-screen/raw mode)
+    // would freeze the UI instead of showing the user anything.
+    let secret = ratwarren::secret::resolve(conn);
+    if let Some(note) = secret.note() {
+        eprintln!("note: {note}");
     }
-
     eprintln!("connecting to {name}…");
-    let source = match PostgresDataSource::connect(conn, password.as_deref()).await {
+    let source = PostgresDataSource::connect(conn, secret.password()).await;
+    drop(secret);
+    let source = match source {
         Ok(source) => source,
         Err(e) => {
             eprintln!("{}", ratwarren::ui::error_chain(&e));
@@ -93,8 +111,52 @@ async fn main() -> ExitCode {
     }
 }
 
-fn pick_connection(config: &Config) -> Result<String, ExitCode> {
-    if let Some(name) = std::env::args().nth(1) {
+fn set_password(name: &str) -> ExitCode {
+    let config = match Config::load() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("failed to load config: {}", ratwarren::ui::error_chain(&e));
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(conn) = config.connection(name) else {
+        print_available(&config);
+        return ExitCode::from(2);
+    };
+    let Some(account) = conn.keyring_account() else {
+        eprintln!(
+            "connection {name:?} has no `password` entry in the config; add \
+             [connections.password] / source = \"keyring\" first"
+        );
+        return ExitCode::from(2);
+    };
+
+    let password =
+        match ratwarren::secret::read_password_from_stdin(&format!("password for {name}: ")) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                eprintln!("no password entered, nothing stored");
+                return ExitCode::from(1);
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(1);
+            }
+        };
+
+    let service = conn.keyring_service();
+    let result = keyring::Entry::new(service, &account).and_then(|e| e.set_password(&password));
+    if let Err(e) = result {
+        eprintln!("{}", ratwarren::ui::error_chain(&e));
+        return ExitCode::from(1);
+    }
+
+    println!("stored password for connection {name:?} (service {service:?}, account {account:?})");
+    ExitCode::SUCCESS
+}
+
+fn pick_connection(config: &Config, name: Option<String>) -> Result<String, ExitCode> {
+    if let Some(name) = name {
         if config.connection(&name).is_some() {
             return Ok(name);
         }
@@ -111,6 +173,17 @@ fn pick_connection(config: &Config) -> Result<String, ExitCode> {
 fn print_available(config: &Config) {
     if config.connections.is_empty() {
         eprintln!("no connections configured");
+        if let Ok(path) = ratwarren::config::paths::config_file_path() {
+            eprintln!("add one at {}, for example:", path.display());
+        } else {
+            eprintln!("add one to your config file, for example:");
+        }
+        eprintln!();
+        eprintln!("  [[connections]]");
+        eprintln!("  name = \"prod\"");
+        eprintln!("  host = \"localhost\"");
+        eprintln!("  database = \"app\"");
+        eprintln!("  user = \"app_user\"");
         return;
     }
     eprintln!("usage: ratwarren <connection-name>");

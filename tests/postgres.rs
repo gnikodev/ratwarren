@@ -30,12 +30,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ratwarren::app::message::{WorkerRequest, WorkerResponse};
-use ratwarren::app::run::{QueryOutcome, QueryRequest, QueryResponse, RunOutcome, RunState};
+use ratwarren::app::run::{
+    CancelOutcome, CancelRequest, QueryOutcome, QueryRequest, QueryResponse, RunOutcome, RunState,
+    RunSummary,
+};
 use ratwarren::app::worker;
 use ratwarren::config::Connection;
 use ratwarren::datasource::{
-    ConnectOptions, DataSource, DataSourceError, PostgresDataSource, QueryId, Row, TableKind,
-    quote_ident, select_page_sql,
+    ConnectOptions, DataSource, DataSourceError, PostgresDataSource, Row, TableKind, quote_ident,
+    select_page_sql,
 };
 use ratwarren::editor::{Motion, RunTarget, RunUnit, TextBuffer, plan_run};
 use ratwarren::ui::RequestId;
@@ -1228,7 +1231,7 @@ async fn query_worker_reports_no_result_set_for_a_zero_row_update() {
 
 type RequestSender = tokio::sync::mpsc::UnboundedSender<WorkerRequest>;
 type ResponseReceiver = tokio::sync::mpsc::UnboundedReceiver<WorkerResponse>;
-type CancelSender = tokio::sync::mpsc::UnboundedSender<QueryId>;
+type CancelSender = tokio::sync::mpsc::UnboundedSender<CancelRequest>;
 
 struct FullWorker {
     request_tx: RequestSender,
@@ -1277,12 +1280,12 @@ async fn shutdown_full_worker(
 async fn drive_run(
     request_tx: &tokio::sync::mpsc::UnboundedSender<WorkerRequest>,
     response_rx: &mut tokio::sync::mpsc::UnboundedReceiver<WorkerResponse>,
-    cancel_tx: &tokio::sync::mpsc::UnboundedSender<QueryId>,
+    cancel_tx: &tokio::sync::mpsc::UnboundedSender<CancelRequest>,
     plan: Vec<RunUnit>,
     per_response_timeout: Duration,
 ) -> (
     Vec<Result<QueryOutcome, DataSourceError>>,
-    Option<ratwarren::app::run::RunSummary>,
+    Option<RunSummary>,
 ) {
     let mut state = RunState::new();
     let mut results = Vec::new();
@@ -1303,8 +1306,8 @@ async fn drive_run(
             };
             match q {
                 QueryResponse::Started { id, query_id } => {
-                    if let Some(qid) = state.on_started(id, query_id) {
-                        let _ = cancel_tx.send(qid);
+                    if let Some(cancel_req) = state.on_started(id, query_id) {
+                        let _ = cancel_tx.send(cancel_req);
                     }
                 }
                 QueryResponse::Finished { id, result } => {
@@ -1323,7 +1326,7 @@ async fn drive_run(
                         RunOutcome::Done(summary) => return (results, Some(summary)),
                     }
                 }
-                QueryResponse::CancelFailed { message } => {
+                QueryResponse::CancelFailed { message, .. } => {
                     panic!("unexpected CancelFailed: {message}");
                 }
             }
@@ -1390,7 +1393,7 @@ async fn full_run_path_cursor_statement_runs_only_the_statement_under_the_cursor
     let summary = summary.expect("plan was non-empty");
     assert_eq!(summary.ran, 1);
     assert_eq!(summary.total, 1);
-    assert!(!summary.cancelled);
+    assert_eq!(summary.cancelled, None);
     assert_eq!(summary.failed, None);
 
     shutdown_full_worker(request_tx, cancel_tx, worker_handle, canceller_handle).await;
@@ -1448,7 +1451,7 @@ async fn full_run_path_selection_spanning_two_statements_runs_both_in_order() {
     let summary = summary.expect("plan was non-empty");
     assert_eq!(summary.ran, 2);
     assert_eq!(summary.total, 2);
-    assert!(!summary.cancelled);
+    assert_eq!(summary.cancelled, None);
     assert_eq!(summary.failed, None);
     assert_no_further_response_arrives(&mut response_rx).await;
 
@@ -1514,7 +1517,7 @@ async fn full_run_path_whole_buffer_runs_mixed_ddl_dml_select_in_order() {
     let summary = summary.expect("plan was non-empty");
     assert_eq!(summary.ran, 3);
     assert_eq!(summary.total, 3);
-    assert!(!summary.cancelled);
+    assert_eq!(summary.cancelled, None);
     assert_eq!(summary.failed, None);
 
     shutdown_full_worker(request_tx, cancel_tx, worker_handle, canceller_handle).await;
@@ -1569,7 +1572,7 @@ async fn full_run_path_stops_on_the_first_error_and_never_issues_the_third_state
     let summary = summary.expect("plan was non-empty");
     assert_eq!(summary.ran, 2);
     assert_eq!(summary.total, 3);
-    assert!(!summary.cancelled);
+    assert_eq!(summary.cancelled, None);
     assert!(summary.failed.is_some());
 
     // The third statement was never sent, so nothing further should ever
@@ -1618,10 +1621,10 @@ async fn full_run_path_cancel_mid_run_stops_the_run_and_never_issues_the_next_st
         state.on_started(id, query_id).is_none(),
         "no cancel was requested yet, so on_started must not fire one"
     );
-    let qid = state
+    let cancel_req = state
         .request_cancel()
         .expect("the QueryId is already known, so the cancel must fire immediately");
-    cancel_tx.send(qid).expect("canceller task alive");
+    cancel_tx.send(cancel_req).expect("canceller task alive");
 
     let finished = tokio::time::timeout(Duration::from_secs(10), response_rx.recv())
         .await
@@ -1645,7 +1648,7 @@ async fn full_run_path_cancel_mid_run_stops_the_run_and_never_issues_the_next_st
         RunOutcome::Done(summary) => summary,
         RunOutcome::Next(_) => panic!("a cancelled statement must stop the run, not continue"),
     };
-    assert!(summary.cancelled);
+    assert_eq!(summary.cancelled, Some(CancelOutcome::Interrupted));
     assert_eq!(summary.failed, None);
     assert_eq!(summary.ran, 1);
     assert_eq!(summary.total, 2);
@@ -1865,13 +1868,13 @@ async fn full_run_path_abandon_and_retry_is_reliable_across_repeated_back_to_bac
                                 RunOutcome::Done(summary) => {
                                     assert_eq!(summary.ran, 2, "iteration {i}");
                                     assert_eq!(summary.total, 2, "iteration {i}");
-                                    assert!(!summary.cancelled, "iteration {i}");
+                                    assert_eq!(summary.cancelled, None, "iteration {i}");
                                     assert_eq!(summary.failed, None, "iteration {i}");
                                     return;
                                 }
                             }
                         }
-                        QueryResponse::CancelFailed { message } => {
+                        QueryResponse::CancelFailed { message, .. } => {
                             panic!("iteration {i}: unexpected CancelFailed: {message}")
                         }
                     }

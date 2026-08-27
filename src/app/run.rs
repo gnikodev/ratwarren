@@ -26,6 +26,7 @@ pub enum QueryResponse {
         result: Result<QueryOutcome, DataSourceError>,
     },
     CancelFailed {
+        id: RequestId,
         message: String,
     },
 }
@@ -40,7 +41,27 @@ pub struct RunSummary {
     pub total: usize,
     pub last_affected: Option<u64>,
     pub failed: Option<String>,
-    pub cancelled: bool,
+    pub cancelled: Option<CancelOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// Server aborted the statement (DataSourceError::Cancelled) -- its
+    /// effects are rolled back.
+    Interrupted,
+    /// The statement completed and committed before the cancel landed; the
+    /// run stopped before the next statement.
+    CompletedFirst,
+}
+
+/// Scopes a cancel to the `RequestId` that was active when it was requested,
+/// so `CancelFailed` (which only carries a `QueryId`-derived error from the
+/// transport, not the request that triggered it) can still be checked
+/// against a possibly-superseded run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CancelRequest {
+    pub id: RequestId,
+    pub query_id: QueryId,
 }
 
 pub struct RunState {
@@ -104,28 +125,33 @@ impl RunState {
         self.active_id == Some(id)
     }
 
-    /// Returns Some(qid) when a cancel was already requested (before the
-    /// QueryId was known) and must be fired now.
-    pub fn on_started(&mut self, id: RequestId, qid: QueryId) -> Option<QueryId> {
+    /// Returns Some(CancelRequest) when a cancel was already requested
+    /// (before the QueryId was known) and must be fired now.
+    pub fn on_started(&mut self, id: RequestId, qid: QueryId) -> Option<CancelRequest> {
         if !self.owns(id) {
             return None;
         }
         self.active_query_id = Some(qid);
         if self.cancel_requested {
-            Some(qid)
+            Some(CancelRequest { id, query_id: qid })
         } else {
             None
         }
     }
 
-    /// Marks a cancel wanted; returns Some(qid) if it can be sent immediately
-    /// (the QueryId is already known), None if it must wait for on_started.
-    pub fn request_cancel(&mut self) -> Option<QueryId> {
+    /// Marks a cancel wanted; returns Some(CancelRequest) if it can be sent
+    /// immediately (the QueryId is already known), None if it must wait for
+    /// on_started.
+    pub fn request_cancel(&mut self) -> Option<CancelRequest> {
         if !self.is_active() {
             return None;
         }
         self.cancel_requested = true;
-        self.active_query_id
+        let id = self
+            .active_id
+            .expect("is_active() confirmed active_id is Some");
+        let query_id = self.active_query_id?;
+        Some(CancelRequest { id, query_id })
     }
 
     pub fn on_finished(
@@ -143,8 +169,14 @@ impl RunState {
         let total = self.plan.len();
         match result {
             Err(e) => {
-                let cancelled = matches!(e, DataSourceError::Cancelled);
-                let failed = if cancelled {
+                // A genuine server-side Cancelled is an interruption
+                // regardless of whether `self.cancel_requested` was actually
+                // set -- a cancel from elsewhere (e.g. a future
+                // admin-initiated pg_cancel_backend) is still a real
+                // interruption, not a clean failure.
+                let cancelled =
+                    matches!(e, DataSourceError::Cancelled).then_some(CancelOutcome::Interrupted);
+                let failed = if cancelled.is_some() {
                     None
                 } else {
                     Some(crate::ui::error_chain(e))
@@ -171,7 +203,7 @@ impl RunState {
                         total,
                         last_affected: self.last_affected,
                         failed: None,
-                        cancelled: true,
+                        cancelled: Some(CancelOutcome::CompletedFirst),
                     }));
                 }
                 self.index += 1;
@@ -182,7 +214,7 @@ impl RunState {
                         total,
                         last_affected: self.last_affected,
                         failed: None,
-                        cancelled: false,
+                        cancelled: None,
                     }))
                 } else {
                     let id = self.next_id();
@@ -256,7 +288,7 @@ mod tests {
         };
         assert_eq!(summary.ran, 2);
         assert_eq!(summary.total, 3);
-        assert!(!summary.cancelled);
+        assert_eq!(summary.cancelled, None);
         assert!(summary.failed.is_some());
         assert!(!state.is_active());
 
@@ -311,7 +343,7 @@ mod tests {
         assert_eq!(summary.ran, 3);
         assert_eq!(summary.total, 3);
         assert_eq!(summary.failed, None);
-        assert!(!summary.cancelled);
+        assert_eq!(summary.cancelled, None);
         assert_eq!(summary.last_affected, Some(7));
         assert!(!state.is_active());
     }
@@ -334,7 +366,10 @@ mod tests {
         let fired = state.on_started(RequestId(0), qid);
         assert_eq!(
             fired,
-            Some(qid),
+            Some(CancelRequest {
+                id: RequestId(0),
+                query_id: qid
+            }),
             "on_started must fire the deferred cancel as soon as the QueryId is known"
         );
     }
@@ -354,7 +389,10 @@ mod tests {
 
         assert_eq!(
             state.request_cancel(),
-            Some(qid),
+            Some(CancelRequest {
+                id: RequestId(0),
+                query_id: qid
+            }),
             "a cancel requested after the QueryId is known must fire immediately"
         );
     }
@@ -402,9 +440,10 @@ mod tests {
             RunOutcome::Done(summary) => summary,
             RunOutcome::Next(_) => panic!("a cancelled statement must stop the run"),
         };
-        assert!(
+        assert_eq!(
             summary.cancelled,
-            "a genuine Cancelled error must set cancelled: true"
+            Some(CancelOutcome::Interrupted),
+            "a genuine Cancelled error must report CancelOutcome::Interrupted"
         );
         assert_eq!(
             summary.failed, None,
@@ -492,7 +531,10 @@ mod tests {
         state.on_started(req1.id, qid);
         assert_eq!(
             state.request_cancel(),
-            Some(qid),
+            Some(CancelRequest {
+                id: req1.id,
+                query_id: qid
+            }),
             "a cancel requested after the QueryId is known must fire immediately"
         );
 
@@ -507,7 +549,7 @@ mod tests {
                  asked to cancel would still run"
             ),
         };
-        assert!(summary.cancelled);
+        assert_eq!(summary.cancelled, Some(CancelOutcome::CompletedFirst));
         assert_eq!(summary.failed, None);
         assert_eq!(summary.ran, 1);
         assert_eq!(summary.total, 3);
@@ -536,7 +578,7 @@ mod tests {
                  in-flight statement finishes Ok(), not advance to the next statement"
             ),
         };
-        assert!(summary.cancelled);
+        assert_eq!(summary.cancelled, Some(CancelOutcome::CompletedFirst));
         assert_eq!(summary.failed, None);
         assert_eq!(summary.ran, 1);
         assert_eq!(summary.total, 3);
@@ -551,7 +593,13 @@ mod tests {
 
         let qid = crate::datasource::QueryId::for_test(1);
         state.on_started(req1.id, qid);
-        assert_eq!(state.request_cancel(), Some(qid));
+        assert_eq!(
+            state.request_cancel(),
+            Some(CancelRequest {
+                id: req1.id,
+                query_id: qid
+            })
+        );
 
         let outcome = state
             .on_finished(req1.id, &Ok(QueryOutcome::NoResultSet { rows_affected: 0 }))
@@ -560,8 +608,9 @@ mod tests {
             RunOutcome::Done(summary) => summary,
             RunOutcome::Next(_) => panic!("a 1-statement plan must not advance further"),
         };
-        assert!(
+        assert_eq!(
             summary.cancelled,
+            Some(CancelOutcome::CompletedFirst),
             "the cancel check must happen before the index >= total clean-completion branch"
         );
         assert_eq!(summary.failed, None);

@@ -1,6 +1,6 @@
 use crate::app::message::{WorkerRequest, WorkerResponse};
-use crate::app::run::{QueryOutcome, QueryRequest, QueryResponse};
-use crate::datasource::{self, DataSource, DataSourceError, QueryId};
+use crate::app::run::{CancelRequest, QueryOutcome, QueryRequest, QueryResponse};
+use crate::datasource::{self, DataSource, DataSourceError};
 use crate::ui::grid::message::{GridRequest, GridResponse};
 use crate::ui::grid::page;
 use crate::ui::tree::message::{TreeRequest, TreeResponse};
@@ -76,13 +76,14 @@ pub fn spawn(
 /// itself deadlock against the worker holding the permit.
 pub fn spawn_canceller(
     source: std::sync::Arc<dyn DataSource>,
-    mut cancels: tokio::sync::mpsc::UnboundedReceiver<QueryId>,
+    mut cancels: tokio::sync::mpsc::UnboundedReceiver<CancelRequest>,
     responses: tokio::sync::mpsc::UnboundedSender<WorkerResponse>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(qid) = cancels.recv().await {
-            if let Err(e) = source.cancel(qid).await {
+        while let Some(req) = cancels.recv().await {
+            if let Err(e) = source.cancel(req.query_id).await {
                 let _ = responses.send(WorkerResponse::Query(QueryResponse::CancelFailed {
+                    id: req.id,
                     message: crate::ui::error_chain(&e),
                 }));
             }

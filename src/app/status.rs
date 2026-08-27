@@ -2,6 +2,7 @@
 pub enum StatusKind {
     Info,
     Error,
+    Warn,
 }
 
 #[derive(Debug, Clone)]
@@ -21,6 +22,13 @@ impl Status {
     pub fn error(text: impl Into<String>) -> Self {
         Self {
             kind: StatusKind::Error,
+            text: text.into(),
+        }
+    }
+
+    pub fn warn(text: impl Into<String>) -> Self {
+        Self {
+            kind: StatusKind::Warn,
             text: text.into(),
         }
     }

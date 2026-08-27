@@ -23,6 +23,12 @@ async-trait = "0.1"
 # Span::end says "inclusive", which is wrong — that's an unwritten contract we
 # can't rely on surviving a future upgrade without re-verifying.
 sqlparser = { version = "=0.62.0", default-features = false, features = ["std"] }
+# Default features are load-bearing: `default = ["v1"]` selects the
+# per-platform native store (Keychain / Credential Manager / Secret Service);
+# `default-features = false` trips the crate's own compile_error!. Verified
+# against 4.1.6: Entry::new(service, account) -> Result<Entry>, get_password()
+# -> Result<String>, Error::NoEntry when the item is absent.
+keyring = "4"
 
 [dev-dependencies]
 tempfile = "3"
