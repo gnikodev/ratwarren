@@ -42,6 +42,12 @@ impl Page {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GridContent {
+    Rows(Page),
+    NoResultSet { rows_affected: u64 },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

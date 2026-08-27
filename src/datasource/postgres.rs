@@ -18,6 +18,13 @@ pub struct ConnectOptions {
     pub cancel_timeout: Duration,
     pub abandon_grace: Duration,
     pub cancel_settle: Duration,
+    // Deliberately separate from `cancel_timeout` (5s, used by the
+    // user-initiated `cancel()`): measured `cancel_query` latency is
+    // 105-220µs, so reusing the 5s user-facing timeout in the abandon
+    // retry loop below would let a handful of stuck attempts blow past
+    // `retry_on_busy`'s 10s budget on its own.
+    pub abandon_cancel_timeout: Duration,
+    pub cancel_escalate: Duration,
 }
 
 impl Default for ConnectOptions {
@@ -40,6 +47,8 @@ impl Default for ConnectOptions {
             // sacred or safely deletable — re-measure against a real server
             // before changing it.
             cancel_settle: Duration::from_millis(25),
+            abandon_cancel_timeout: Duration::from_secs(1),
+            cancel_escalate: Duration::from_secs(1),
         }
     }
 }
@@ -68,6 +77,9 @@ pub struct PostgresDataSource {
     cancel_timeout: Duration,
     abandon_grace: Duration,
     cancel_settle: Duration,
+    abandon_cancel_timeout: Duration,
+    cancel_escalate: Duration,
+    abandon_stats: Arc<AbandonStats>,
 }
 
 impl PostgresDataSource {
@@ -172,11 +184,22 @@ impl PostgresDataSource {
             cancel_timeout: options.cancel_timeout,
             abandon_grace: options.abandon_grace,
             cancel_settle: options.cancel_settle,
+            abandon_cancel_timeout: options.abandon_cancel_timeout,
+            cancel_escalate: options.cancel_escalate,
+            abandon_stats: Arc::new(AbandonStats::default()),
         })
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Exists for test observability into the abandon/cancel-escalation
+    /// path (`drain_abandoned`) so a regression test can assert on the
+    /// actual defect -- cancel delay, give-up count -- instead of only an
+    /// end-to-end timeout. Not surfaced in the UI.
+    pub fn abandon_stats(&self) -> Arc<AbandonStats> {
+        Arc::clone(&self.abandon_stats)
     }
 
     pub fn dialed_addr(&self) -> (&str, u16) {
@@ -358,8 +381,10 @@ impl DataSource for PostgresDataSource {
                 cancel_token: self.cancel_token.clone(),
                 start_gate: Arc::clone(&self.start_gate),
                 grace: self.abandon_grace,
-                cancel_timeout: self.cancel_timeout,
                 cancel_settle: self.cancel_settle,
+                abandon_cancel_timeout: self.abandon_cancel_timeout,
+                cancel_escalate: self.cancel_escalate,
+                stats: Arc::clone(&self.abandon_stats),
             }),
             state: StreamState::Streaming,
         })
@@ -434,13 +459,80 @@ impl DataSource for PostgresDataSource {
     }
 }
 
+const ABANDON_MAX_CANCEL_ATTEMPTS: u32 = 3;
+
+/// Observability for the abandon/cancel-escalation path in
+/// `drain_abandoned`: exists specifically so a test can assert on the actual
+/// defect instead of only observing an end-to-end timeout. Not surfaced in
+/// the UI.
+///
+/// The delay that matters is the FIRST attempt's. The original defect
+/// (tokio-postgres's stream starving `timeout(grace, &mut drain)`'s `Sleep`)
+/// manifests as attempt 1 firing hundreds of ms to seconds after
+/// `abandon_grace`. Attempts 2+ legitimately fire ~`cancel_escalate` apart
+/// by design, so mixing them into one "last delay" number makes a regression
+/// of the original bug indistinguishable from the escalation loop working
+/// correctly -- which is precisely what made the first regression test flaky.
+#[derive(Default)]
+pub struct AbandonStats {
+    abandons: std::sync::atomic::AtomicU64,
+    /// Abandons that got as far as actually issuing their first
+    /// cancel_query -- i.e. the drain outlived abandon_grace AND the
+    /// active_id recheck said a cancel was still warranted.
+    first_cancels: std::sync::atomic::AtomicU64,
+    /// Delay from abandon to the first cancel attempt of the most recent
+    /// abandon that issued one. Never written by attempts 2+.
+    first_cancel_delay_ms: std::sync::atomic::AtomicU64,
+    /// Abandons whose drain outlived the first cancel + cancel_escalate.
+    /// Expected to be non-zero for very large abandoned result sets; a
+    /// diagnostic to watch, not a failure condition.
+    multi_attempt_abandons: std::sync::atomic::AtomicU64,
+    cancel_send_failures: std::sync::atomic::AtomicU64,
+    cancel_timeouts: std::sync::atomic::AtomicU64,
+    cancel_gave_up: std::sync::atomic::AtomicU64,
+}
+
+impl AbandonStats {
+    pub fn abandons(&self) -> u64 {
+        self.abandons.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn first_cancels(&self) -> u64 {
+        self.first_cancels
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn first_cancel_delay(&self) -> Duration {
+        Duration::from_millis(
+            self.first_cancel_delay_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+    pub fn multi_attempt_abandons(&self) -> u64 {
+        self.multi_attempt_abandons
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn cancel_send_failures(&self) -> u64 {
+        self.cancel_send_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn cancel_timeouts(&self) -> u64 {
+        self.cancel_timeouts
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn cancel_gave_up(&self) -> u64 {
+        self.cancel_gave_up
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct AbandonCtx {
     pub(crate) cancel_token: tokio_postgres::CancelToken,
     pub(crate) start_gate: Arc<tokio::sync::Mutex<()>>,
     pub(crate) grace: Duration,
-    pub(crate) cancel_timeout: Duration,
     pub(crate) cancel_settle: Duration,
+    pub(crate) abandon_cancel_timeout: Duration,
+    pub(crate) cancel_escalate: Duration,
+    pub(crate) stats: Arc<AbandonStats>,
 }
 
 impl AbandonCtx {
@@ -483,34 +575,102 @@ async fn drain_abandoned(
             if item.is_err() {
                 break;
             }
+            // tokio-postgres's stream has no tokio coop integration and serves
+            // thousands of rows out of one buffered BackendMessages batch, so a
+            // tight drain loop stays inside a single poll() for seconds and
+            // starves the timeout below. Measured firing up to 6.9s late
+            // instead of the 100ms grace against a real Postgres -- that
+            // starvation, not an unreliable cancel_query, is what made this
+            // path look flaky. Re-measure before removing.
+            tokio::task::coop::consume_budget().await;
         }
     };
+    let abandoned_at = tokio::time::Instant::now();
+    ctx.stats.abandons.fetch_add(1, Ordering::Relaxed);
     tokio::pin!(drain);
-    if allow_cancel && tokio::time::timeout(ctx.grace, &mut drain).await.is_err() {
-        {
-            let _gate = ctx.start_gate.lock().await;
-            if active_id.load(Ordering::Acquire) == query_id.0 {
-                match tokio::time::timeout(
-                    ctx.cancel_timeout,
-                    ctx.cancel_token.cancel_query(tokio_postgres::NoTls),
-                )
-                .await
-                {
-                    // Same asymmetry as PostgresDataSource::cancel: a
-                    // timeout means the cancel packet may already be in
-                    // transit, so it gets the settle delay too — only an
-                    // explicit send failure (definitely nothing in flight)
-                    // skips it.
-                    Ok(Ok(())) | Err(_) => {
-                        tokio::time::sleep(ctx.cancel_settle).await;
+
+    // Cancel escalation is bounded (a few seconds worst case), but the DRAIN
+    // ITSELF is never bounded or abandoned early: releasing the permit while
+    // the server might still be streaming would let the next query silently
+    // read the abandoned query's leftover rows as its own results, which is
+    // worse than a slow permit. There is no MVP0 reconnect story, so giving up
+    // on a stuck connection isn't a safe option -- only the cancel retry is
+    // bounded, not the fallback natural drain.
+    if !allow_cancel {
+        drain.await;
+    } else {
+        let mut attempt = 0u32;
+        let mut wait = ctx.grace;
+        loop {
+            if tokio::time::timeout(wait, &mut drain).await.is_ok() {
+                break;
+            }
+            attempt += 1;
+            if attempt == 2 {
+                // The drain outlived attempt 1 + cancel_escalate. Counted
+                // whether or not attempt 2 ends up sending anything: the
+                // signal is "one cancel wasn't enough", independent of the
+                // active_id recheck.
+                ctx.stats
+                    .multi_attempt_abandons
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+
+            let sent = {
+                let _gate = ctx.start_gate.lock().await;
+                if active_id.load(Ordering::Acquire) != query_id.0 {
+                    None
+                } else {
+                    if attempt == 1 {
+                        // Recorded here, not above: only for attempt 1
+                        // (attempts 2+ are the escalation design, not the
+                        // defect this guards), and only once we're actually
+                        // committed to sending. Measured after the gate
+                        // acquisition on purpose: gate wait is part of how
+                        // late the cancel really goes out.
+                        ctx.stats.first_cancels.fetch_add(1, Ordering::Relaxed);
+                        ctx.stats
+                            .first_cancel_delay_ms
+                            .store(abandoned_at.elapsed().as_millis() as u64, Ordering::Relaxed);
                     }
-                    Ok(Err(_)) => {}
+                    Some(
+                        tokio::time::timeout(
+                            ctx.abandon_cancel_timeout,
+                            ctx.cancel_token.cancel_query(tokio_postgres::NoTls),
+                        )
+                        .await,
+                    )
+                }
+            };
+
+            match sent {
+                None => {
+                    drain.await;
+                    break;
+                }
+                Some(Ok(Ok(()))) => tokio::time::sleep(ctx.cancel_settle).await,
+                // Same asymmetry as PostgresDataSource::cancel: a timeout
+                // means the cancel packet may already be in transit, so it
+                // gets the settle delay too — only an explicit send failure
+                // (definitely nothing in flight) skips it.
+                Some(Ok(Err(_))) => {
+                    ctx.stats
+                        .cancel_send_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Some(Err(_)) => {
+                    ctx.stats.cancel_timeouts.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(ctx.cancel_settle).await;
                 }
             }
+
+            if attempt >= ABANDON_MAX_CANCEL_ATTEMPTS {
+                ctx.stats.cancel_gave_up.fetch_add(1, Ordering::Relaxed);
+                drain.await;
+                break;
+            }
+            wait = ctx.cancel_escalate;
         }
-        drain.await;
-    } else if !allow_cancel {
-        drain.await;
     }
     let _ = active_id.compare_exchange(query_id.0, 0, Ordering::Release, Ordering::Relaxed);
     drop(permit);

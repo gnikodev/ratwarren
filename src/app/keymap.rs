@@ -1,6 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::Focus;
+use crate::editor::Motion;
+use crate::ui::editor::EditorCommand;
 use crate::ui::grid::state::GridCommand;
 use crate::ui::tree::state::TreeCommand;
 
@@ -11,19 +13,39 @@ pub enum AppCommand {
     Activate,
     Tree(TreeCommand),
     Grid(GridCommand),
+    Editor(EditorCommand),
+    Run(RunKey),
+    CancelOrQuit,
+}
+
+pub enum RunKey {
+    CursorOrSelection,
+    Buffer,
 }
 
 pub fn map_key(key: KeyEvent, focus: Focus) -> Option<AppCommand> {
     match (key.code, key.modifiers) {
-        (KeyCode::Char('q'), _) => return Some(AppCommand::Quit),
-        (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Some(AppCommand::Quit),
         (KeyCode::Tab, _) => return Some(AppCommand::ToggleFocus),
         (KeyCode::Esc, _) if focus == Focus::Grid => return Some(AppCommand::FocusTree),
+        // `Ctrl+C` is context-sensitive rather than a hardcoded Quit: it
+        // cancels an in-flight run if one exists, and only quits otherwise
+        // (see `App::on_key`'s `CancelOrQuit` handling).
+        (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Some(AppCommand::CancelOrQuit),
+        // Run is bound globally (not gated to `Focus::Editor`): a natural
+        // workflow is "look at the grid, then run again" without first
+        // tabbing back to the editor pane.
+        (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+            return Some(AppCommand::Run(RunKey::CursorOrSelection));
+        }
+        (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+            return Some(AppCommand::Run(RunKey::Buffer));
+        }
         _ => {}
     }
 
     match focus {
         Focus::Tree => match (key.code, key.modifiers) {
+            (KeyCode::Char('q'), _) => Some(AppCommand::Quit),
             (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
                 Some(AppCommand::Tree(TreeCommand::MoveUp))
             }
@@ -50,6 +72,7 @@ pub fn map_key(key: KeyEvent, focus: Focus) -> Option<AppCommand> {
             _ => None,
         },
         Focus::Grid => match (key.code, key.modifiers) {
+            (KeyCode::Char('q'), _) => Some(AppCommand::Quit),
             (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
                 Some(AppCommand::Grid(GridCommand::MoveUp))
             }
@@ -73,6 +96,43 @@ pub fn map_key(key: KeyEvent, focus: Focus) -> Option<AppCommand> {
             (KeyCode::Char('n'), _) => Some(AppCommand::Grid(GridCommand::NextPage)),
             (KeyCode::Char('p'), _) => Some(AppCommand::Grid(GridCommand::PrevPage)),
             (KeyCode::Char('r'), _) => Some(AppCommand::Grid(GridCommand::Refresh)),
+            _ => None,
+        },
+        Focus::Editor => match (key.code, key.modifiers) {
+            (KeyCode::Char(c), KeyModifiers::NONE) | (KeyCode::Char(c), KeyModifiers::SHIFT) => {
+                Some(AppCommand::Editor(EditorCommand::Insert(c)))
+            }
+            (KeyCode::Enter, _) => Some(AppCommand::Editor(EditorCommand::Newline)),
+            (KeyCode::Backspace, _) => Some(AppCommand::Editor(EditorCommand::DeleteBackward)),
+            (KeyCode::Delete, _) => Some(AppCommand::Editor(EditorCommand::DeleteForward)),
+            (KeyCode::Left, KeyModifiers::SHIFT) => {
+                Some(AppCommand::Editor(EditorCommand::Left(Motion::Extend)))
+            }
+            (KeyCode::Left, _) => Some(AppCommand::Editor(EditorCommand::Left(Motion::Move))),
+            (KeyCode::Right, KeyModifiers::SHIFT) => {
+                Some(AppCommand::Editor(EditorCommand::Right(Motion::Extend)))
+            }
+            (KeyCode::Right, _) => Some(AppCommand::Editor(EditorCommand::Right(Motion::Move))),
+            (KeyCode::Up, KeyModifiers::SHIFT) => {
+                Some(AppCommand::Editor(EditorCommand::Up(Motion::Extend)))
+            }
+            (KeyCode::Up, _) => Some(AppCommand::Editor(EditorCommand::Up(Motion::Move))),
+            (KeyCode::Down, KeyModifiers::SHIFT) => {
+                Some(AppCommand::Editor(EditorCommand::Down(Motion::Extend)))
+            }
+            (KeyCode::Down, _) => Some(AppCommand::Editor(EditorCommand::Down(Motion::Move))),
+            (KeyCode::Home, KeyModifiers::CONTROL) => {
+                Some(AppCommand::Editor(EditorCommand::BufferStart(Motion::Move)))
+            }
+            (KeyCode::Home, _) => Some(AppCommand::Editor(EditorCommand::LineStart(Motion::Move))),
+            (KeyCode::End, KeyModifiers::CONTROL) => {
+                Some(AppCommand::Editor(EditorCommand::BufferEnd(Motion::Move)))
+            }
+            (KeyCode::End, _) => Some(AppCommand::Editor(EditorCommand::LineEnd(Motion::Move))),
+            (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
+                Some(AppCommand::Editor(EditorCommand::SelectAll))
+            }
+            (KeyCode::Esc, _) => Some(AppCommand::Editor(EditorCommand::ClearSelection)),
             _ => None,
         },
     }
@@ -144,23 +204,90 @@ mod tests {
     }
 
     #[test]
-    fn quit_and_toggle_focus_are_global_regardless_of_focus() {
-        for focus in [Focus::Tree, Focus::Grid] {
-            assert!(matches!(
-                map_key(key(KeyCode::Char('q')), focus),
-                Some(AppCommand::Quit)
-            ));
-            assert!(matches!(
-                map_key(
-                    KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-                    focus
-                ),
-                Some(AppCommand::Quit)
-            ));
+    fn tab_toggles_focus_regardless_of_focus() {
+        for focus in [Focus::Tree, Focus::Grid, Focus::Editor] {
             assert!(matches!(
                 map_key(key(KeyCode::Tab), focus),
                 Some(AppCommand::ToggleFocus)
             ));
         }
+    }
+
+    #[test]
+    fn q_only_quits_outside_the_editor() {
+        for focus in [Focus::Tree, Focus::Grid] {
+            assert!(matches!(
+                map_key(key(KeyCode::Char('q')), focus),
+                Some(AppCommand::Quit)
+            ));
+        }
+        assert!(matches!(
+            map_key(key(KeyCode::Char('q')), Focus::Editor),
+            Some(AppCommand::Editor(EditorCommand::Insert('q')))
+        ));
+    }
+
+    #[test]
+    fn ctrl_c_is_cancel_or_quit_regardless_of_focus() {
+        for focus in [Focus::Tree, Focus::Grid, Focus::Editor] {
+            assert!(matches!(
+                map_key(
+                    KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                    focus
+                ),
+                Some(AppCommand::CancelOrQuit)
+            ));
+        }
+    }
+
+    #[test]
+    fn ctrl_r_and_ctrl_e_run_regardless_of_focus() {
+        for focus in [Focus::Tree, Focus::Grid, Focus::Editor] {
+            assert!(matches!(
+                map_key(
+                    KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+                    focus
+                ),
+                Some(AppCommand::Run(RunKey::CursorOrSelection))
+            ));
+            assert!(matches!(
+                map_key(
+                    KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+                    focus
+                ),
+                Some(AppCommand::Run(RunKey::Buffer))
+            ));
+        }
+    }
+
+    #[test]
+    fn editor_focus_inserts_printable_characters() {
+        assert!(matches!(
+            map_key(key(KeyCode::Char('x')), Focus::Editor),
+            Some(AppCommand::Editor(EditorCommand::Insert('x')))
+        ));
+    }
+
+    #[test]
+    fn editor_focus_shift_arrow_extends_selection() {
+        assert!(matches!(
+            map_key(
+                KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT),
+                Focus::Editor
+            ),
+            Some(AppCommand::Editor(EditorCommand::Left(Motion::Extend)))
+        ));
+        assert!(matches!(
+            map_key(key(KeyCode::Left), Focus::Editor),
+            Some(AppCommand::Editor(EditorCommand::Left(Motion::Move)))
+        ));
+    }
+
+    #[test]
+    fn editor_focus_esc_clears_selection_instead_of_focus_tree() {
+        assert!(matches!(
+            map_key(key(KeyCode::Esc), Focus::Editor),
+            Some(AppCommand::Editor(EditorCommand::ClearSelection))
+        ));
     }
 }

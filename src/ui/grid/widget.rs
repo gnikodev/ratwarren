@@ -5,13 +5,14 @@ use ratatui::text::Span;
 use ratatui::widgets::{Block, Cell, Paragraph, Row, StatefulWidget, Table, TableState, Widget};
 
 use crate::ui::Load;
-use crate::ui::grid::page::Page;
-use crate::ui::grid::state::DataGridState;
+use crate::ui::grid::page::{GridContent, Page};
+use crate::ui::grid::state::{DataGridState, GridOrigin};
 
 const MIN_COL_WIDTH: u16 = 3;
 const MAX_COL_WIDTH: u16 = 40;
 const COLUMN_SPACING: u16 = 1;
 const NULL_DISPLAY: &str = "NULL";
+const MAX_QUERY_TITLE_CHARS: usize = 60;
 
 pub struct DataGridWidget<'a> {
     block: Option<Block<'a>>,
@@ -51,9 +52,9 @@ impl StatefulWidget for DataGridWidget<'_> {
         let inner = block.inner(area);
         state.set_viewport_height(inner.height.saturating_sub(1).max(1));
 
-        let (page_load, table_state, col_offset) = state.parts();
+        let (content_load, table_state, col_offset) = state.parts();
 
-        let page = match page_load {
+        let page = match content_load {
             Load::NotLoaded | Load::Loading { .. } => {
                 render_message(block, area, buf, "loading…", Style::default());
                 return;
@@ -63,11 +64,16 @@ impl StatefulWidget for DataGridWidget<'_> {
                 render_message(block, area, buf, &text, Style::default().fg(Color::Red));
                 return;
             }
-            Load::Loaded(page) if page.is_empty() => {
+            Load::Loaded(GridContent::NoResultSet { rows_affected }) => {
+                let text = format!("no result set · {rows_affected} rows affected");
+                render_message(block, area, buf, &text, Style::default());
+                return;
+            }
+            Load::Loaded(GridContent::Rows(page)) if page.is_empty() => {
                 render_message(block, area, buf, "(no rows)", Style::default());
                 return;
             }
-            Load::Loaded(page) => page,
+            Load::Loaded(GridContent::Rows(page)) => page,
         };
         render_table(
             page,
@@ -83,13 +89,40 @@ impl StatefulWidget for DataGridWidget<'_> {
 }
 
 fn attach_titles<'a>(block: Block<'a>, state: &DataGridState) -> Block<'a> {
-    let Some((schema, table)) = state.target() else {
-        return block;
-    };
-    let top = format!(" {schema}.{table} ");
+    match state.origin() {
+        None => block,
+        Some(GridOrigin::Table { schema, table }) => {
+            let top = format!(" {schema}.{table} ");
+            let bottom = table_bottom_title(state);
+            block.title(top).title_bottom(bottom)
+        }
+        Some(GridOrigin::Query { title }) => {
+            let top = format!(" query · {} ", truncate_query_title(title));
+            match query_bottom_title(state) {
+                Some(bottom) => block.title(top).title_bottom(bottom),
+                None => block.title(top),
+            }
+        }
+    }
+}
 
-    let bottom = match state.page() {
-        Load::Loaded(page) => {
+fn truncate_query_title(title: &str) -> String {
+    if title.chars().count() > MAX_QUERY_TITLE_CHARS {
+        format!(
+            "{}…",
+            title
+                .chars()
+                .take(MAX_QUERY_TITLE_CHARS)
+                .collect::<String>()
+        )
+    } else {
+        title.to_string()
+    }
+}
+
+fn table_bottom_title(state: &DataGridState) -> String {
+    match state.content() {
+        Load::Loaded(GridContent::Rows(page)) => {
             let offset = state.offset();
             let mut hints = vec!["(unordered)".to_string()];
             if offset > 0 {
@@ -108,9 +141,29 @@ fn attach_titles<'a>(block: Block<'a>, state: &DataGridState) -> Block<'a> {
             format!(" {range} · {} ", hints.join(" · "))
         }
         _ => " (unordered) ".to_string(),
-    };
+    }
+}
 
-    block.title(top).title_bottom(bottom)
+/// Query-origin results have no `[n next]`/`[p prev]` affordances --
+/// `NextPage`/`PrevPage`/`Refresh` are guaranteed no-ops for this origin
+/// (see `DataGridState::command`), so there's nothing to hint at except
+/// whether the result was truncated at `FETCH_LIMIT`.
+fn query_bottom_title(state: &DataGridState) -> Option<String> {
+    match state.content() {
+        Load::Loaded(GridContent::Rows(page)) => {
+            let range = if page.rows.is_empty() {
+                "rows 0".to_string()
+            } else {
+                format!("rows 1-{}", page.rows.len())
+            };
+            Some(if page.has_next {
+                format!(" {range} · more rows exist (add LIMIT/OFFSET) ")
+            } else {
+                format!(" {range} ")
+            })
+        }
+        _ => None,
+    }
 }
 
 fn render_message(block: Block<'_>, area: Rect, buf: &mut Buffer, text: &str, style: Style) {

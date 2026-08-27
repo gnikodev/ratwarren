@@ -32,6 +32,23 @@ impl ByteSpan {
         debug_assert!(text.is_char_boundary(self.end));
         &text[self.start..self.end]
     }
+
+    /// Like `slice`, but `None` instead of a panic when `self` no longer fits
+    /// `text` or no longer lands on char boundaries -- i.e. when the text was
+    /// edited after this span was captured. `slice`'s callers all derive the
+    /// span from the same text in the same expression, so they keep the
+    /// panicking version; this exists for the one caller (`app::error_offset`)
+    /// that holds a span across an await point.
+    pub fn try_slice(self, text: &str) -> Option<&str> {
+        if self.end > text.len()
+            || self.start > self.end
+            || !text.is_char_boundary(self.start)
+            || !text.is_char_boundary(self.end)
+        {
+            return None;
+        }
+        Some(&text[self.start..self.end])
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,6 +325,55 @@ impl Split {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn try_slice_on_an_in_range_span_returns_some() {
+        let text = "SELECT 1; SELECT 2;";
+        let span = ByteSpan { start: 0, end: 8 };
+        assert_eq!(span.try_slice(text), Some("SELECT 1"));
+    }
+
+    #[test]
+    fn try_slice_with_end_past_text_len_returns_none() {
+        let text = "SELECT 1";
+        let span = ByteSpan { start: 0, end: 100 };
+        assert_eq!(span.try_slice(text), None);
+    }
+
+    #[test]
+    fn try_slice_with_start_mid_char_returns_none() {
+        let text = "SELECT '🦀'";
+        let crab_start = text.find('🦀').unwrap();
+        let span = ByteSpan {
+            start: crab_start + 1,
+            end: text.len(),
+        };
+        assert_eq!(span.try_slice(text), None);
+    }
+
+    #[test]
+    fn try_slice_with_end_mid_char_returns_none() {
+        let text = "SELECT '🦀'";
+        let crab_start = text.find('🦀').unwrap();
+        let span = ByteSpan {
+            start: 0,
+            end: crab_start + 1,
+        };
+        assert_eq!(span.try_slice(text), None);
+    }
+
+    #[test]
+    fn try_slice_with_reversed_span_returns_none() {
+        let text = "SELECT 1";
+        let span = ByteSpan { start: 5, end: 2 };
+        assert_eq!(span.try_slice(text), None);
+    }
+
+    #[test]
+    fn try_slice_on_empty_text_with_zero_zero_span_returns_some_empty() {
+        let span = ByteSpan { start: 0, end: 0 };
+        assert_eq!(span.try_slice(""), Some(""));
+    }
 
     /// Canary: this whole module depends on `Span::end` being EXCLUSIVE and
     /// on columns being counted in CHARACTERS, not bytes. Neither is

@@ -4,6 +4,6 @@ pub mod state;
 pub mod widget;
 
 pub use message::{GridRequest, GridResponse};
-pub use page::Page;
-pub use state::{DataGridState, GridCommand};
+pub use page::{GridContent, Page};
+pub use state::{DataGridState, GridCommand, GridOrigin};
 pub use widget::DataGridWidget;

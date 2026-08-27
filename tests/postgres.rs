@@ -29,13 +29,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use ratwarren::app::message::{WorkerRequest, WorkerResponse};
+use ratwarren::app::run::{QueryOutcome, QueryRequest, QueryResponse, RunOutcome, RunState};
 use ratwarren::app::worker;
 use ratwarren::config::Connection;
 use ratwarren::datasource::{
-    ConnectOptions, DataSource, DataSourceError, PostgresDataSource, Row, TableKind, quote_ident,
-    select_page_sql,
+    ConnectOptions, DataSource, DataSourceError, PostgresDataSource, QueryId, Row, TableKind,
+    quote_ident, select_page_sql,
 };
+use ratwarren::editor::{Motion, RunTarget, RunUnit, TextBuffer, plan_run};
+use ratwarren::ui::RequestId;
 use ratwarren::ui::grid::page::FETCH_LIMIT;
+use ratwarren::ui::tree::message::{TreeRequest, TreeResponse};
 
 fn pg_test_enabled() -> bool {
     std::env::var("RATWARREN_TEST_PG").as_deref() == Ok("1")
@@ -984,4 +989,905 @@ async fn fetch_page_error_does_not_leave_the_connection_busy_for_the_next_reques
         schemas.is_ok(),
         "list_schemas should succeed immediately after a failed fetch_page call, got {schemas:?}"
     );
+}
+
+// --- 15+. worker::spawn's WorkerRequest::Query path (Phase 7 execution
+// wiring): the finish()-vs-drop() branch in `handle_query` for genuinely
+// unbounded editor SQL, and retry_on_busy recovering from the abandoned-
+// stream drain that this branch hands off to.
+
+fn spawn_worker(
+    source: Arc<dyn DataSource>,
+) -> (
+    tokio::sync::mpsc::UnboundedSender<WorkerRequest>,
+    tokio::sync::mpsc::UnboundedReceiver<WorkerResponse>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel();
+    let handle = worker::spawn(source, request_rx, response_tx);
+    (request_tx, response_rx, handle)
+}
+
+async fn run_query(
+    request_tx: &tokio::sync::mpsc::UnboundedSender<WorkerRequest>,
+    response_rx: &mut tokio::sync::mpsc::UnboundedReceiver<WorkerResponse>,
+    id: RequestId,
+    sql: &str,
+    timeout: Duration,
+) -> Result<QueryOutcome, DataSourceError> {
+    request_tx
+        .send(WorkerRequest::Query(QueryRequest {
+            id,
+            sql: sql.to_string(),
+        }))
+        .expect("worker task should still be alive to receive the request");
+
+    loop {
+        let response = tokio::time::timeout(timeout, response_rx.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("worker did not respond to query {id:?} ({sql:?}) within {timeout:?}")
+            })
+            .expect("worker response channel should not close mid-test");
+        if let WorkerResponse::Query(QueryResponse::Finished { id: got_id, result }) = response
+            && got_id == id
+        {
+            return result;
+        }
+        // Ignore Started{..} for this id and any stray response for an
+        // unrelated id (there shouldn't be one in these single-request-at-a-
+        // time tests, but ignoring rather than asserting keeps this helper
+        // reusable).
+    }
+}
+
+// The core Phase 7 correctness rule under adversarial conditions: a query
+// with NO LIMIT that returns far more than FETCH_LIMIT rows must not freeze
+// the worker task. If `handle_query` mistakenly called `stream.finish()`
+// after `take(FETCH_LIMIT)` returned exactly FETCH_LIMIT rows, this test
+// would observe the first response taking as long as it takes Postgres to
+// transmit and tokio-postgres to decode all `BIG_N` rows. Verified by hand
+// against this exact test, temporarily replacing the `drop(stream)` branch
+// in `handle_query` with `stream.finish().await`: against a local Docker
+// Postgres, `BIG_N = 200_000` was NOT enough to distinguish the two (both
+// finished in well under a second -- decoding that many one-column rows is
+// simply too fast locally to notice), but `BIG_N = 5_000_000` reliably took
+// ~3.5s with `finish()` and reliably failed the `elapsed < 2s` assertion
+// below, versus comfortably under the threshold with the real `drop()` fix.
+const BIG_N: u64 = 5_000_000;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_worker_does_not_block_on_a_result_set_far_larger_than_fetch_limit() {
+    require_pg!();
+    let ds = connect().await;
+    let schema = unique_schema("bigquery");
+    create_schema(&ds, &schema).await;
+    create_numbered_table(&ds, &schema, BIG_N).await;
+    let q = quote_ident(&schema);
+
+    let source: Arc<dyn DataSource> = Arc::new(ds);
+    let (request_tx, mut response_rx, worker_handle) = spawn_worker(Arc::clone(&source));
+
+    let start = std::time::Instant::now();
+    let outcome = run_query(
+        &request_tx,
+        &mut response_rx,
+        RequestId(1),
+        &format!("SELECT * FROM {q}.t"),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the unbounded SELECT should succeed");
+    let elapsed = start.elapsed();
+
+    match outcome {
+        QueryOutcome::Rows(page) => {
+            assert_eq!(page.rows.len(), 50);
+            assert!(page.has_next);
+        }
+        other => panic!("expected QueryOutcome::Rows with has_next, got {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "handle_query took {elapsed:?} to return the first page of a {BIG_N}-row unbounded \
+         query -- it must return almost immediately after FETCH_LIMIT rows, handing the \
+         remainder off to the background drain path, not block draining everything \
+         synchronously via finish()"
+    );
+
+    // The abandoned stream's background drain now holds the connection's
+    // single permit while it discards the remaining ~BIG_N-50 rows. A second,
+    // unrelated query issued immediately afterward must still eventually
+    // succeed via `retry_on_busy` rather than getting stuck as a permanent
+    // Busy error.
+    let second = run_query(
+        &request_tx,
+        &mut response_rx,
+        RequestId(2),
+        "SELECT 1",
+        Duration::from_secs(10),
+    )
+    .await
+    .expect(
+        "the follow-up query must eventually succeed once the background drain releases \
+             the connection's permit, via retry_on_busy",
+    );
+    match second {
+        QueryOutcome::Rows(page) => assert_eq!(page.rows.len(), 1),
+        other => panic!("expected the follow-up SELECT 1 to return one row, got {other:?}"),
+    }
+
+    drop(request_tx);
+    worker_handle.abort();
+    let _ = worker_handle.await;
+    drop(source);
+
+    let cleanup = connect().await;
+    drop_schema(&cleanup, &schema).await;
+}
+
+// The `rows.len() < FETCH_LIMIT` branch ("provably Ended"): a plain,
+// unbounded SELECT whose real result is smaller than FETCH_LIMIT must still
+// go through `stream.finish()` and leave the connection immediately usable
+// -- same property `fetch_page_drains_before_returning_...` proves for the
+// LIMIT-bounded grid path, now proven for the unbounded editor-SQL path.
+#[tokio::test]
+async fn query_worker_at_fewer_than_fetch_limit_rows_drains_and_frees_the_connection() {
+    require_pg!();
+    let ds = connect().await;
+    let schema = unique_schema("smallquery");
+    create_schema(&ds, &schema).await;
+    create_numbered_table(&ds, &schema, 10).await;
+    let q = quote_ident(&schema);
+
+    let source: Arc<dyn DataSource> = Arc::new(ds);
+    let (request_tx, mut response_rx, worker_handle) = spawn_worker(Arc::clone(&source));
+
+    let outcome = run_query(
+        &request_tx,
+        &mut response_rx,
+        RequestId(1),
+        &format!("SELECT * FROM {q}.t"),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the unbounded SELECT should succeed");
+    match outcome {
+        QueryOutcome::Rows(page) => {
+            assert_eq!(page.rows.len(), 10);
+            assert!(!page.has_next);
+        }
+        other => panic!("expected QueryOutcome::Rows with no next page, got {other:?}"),
+    }
+
+    // Immediately follow up (no sleep/yield): a second query must succeed
+    // right away, not merely "eventually" via retry_on_busy, proving
+    // `finish()` released the permit synchronously in this branch.
+    let second = run_query(
+        &request_tx,
+        &mut response_rx,
+        RequestId(2),
+        "SELECT 1",
+        Duration::from_millis(500),
+    )
+    .await
+    .expect("a query issued immediately after a <FETCH_LIMIT result should not need retrying");
+    assert!(matches!(second, QueryOutcome::Rows(page) if page.rows.len() == 1));
+
+    drop(request_tx);
+    worker_handle.abort();
+    let _ = worker_handle.await;
+    drop(source);
+
+    let cleanup = connect().await;
+    drop_schema(&cleanup, &schema).await;
+}
+
+// DML with no RowDescription (no SELECT list) must surface as
+// `QueryOutcome::NoResultSet`, distinct from a `Rows` outcome with an empty
+// page -- the two are visually and semantically different (e.g. "0 rows
+// affected" vs. "an empty table").
+#[tokio::test]
+async fn query_worker_reports_no_result_set_for_a_zero_row_update() {
+    require_pg!();
+    let ds = connect().await;
+    let schema = unique_schema("dmlquery");
+    create_schema(&ds, &schema).await;
+    create_numbered_table(&ds, &schema, 5).await;
+    let q = quote_ident(&schema);
+
+    let source: Arc<dyn DataSource> = Arc::new(ds);
+    let (request_tx, mut response_rx, worker_handle) = spawn_worker(Arc::clone(&source));
+
+    let outcome = run_query(
+        &request_tx,
+        &mut response_rx,
+        RequestId(1),
+        &format!("UPDATE {q}.t SET n = n WHERE false"),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the UPDATE should succeed");
+    assert_eq!(outcome, QueryOutcome::NoResultSet { rows_affected: 0 });
+
+    drop(request_tx);
+    worker_handle.abort();
+    let _ = worker_handle.await;
+    drop(source);
+
+    let cleanup = connect().await;
+    drop_schema(&cleanup, &schema).await;
+}
+
+// --- 18+. Full run-statement path (Phase 7's explicit test criterion):
+// cursor statement, selection, whole buffer -- driven through the REAL
+// `editor::plan_run` split, the REAL `RunState` sequencer, and the REAL
+// `worker::spawn`/`spawn_canceller` + channels, not a hand-rolled
+// reimplementation of any of those three.
+
+type RequestSender = tokio::sync::mpsc::UnboundedSender<WorkerRequest>;
+type ResponseReceiver = tokio::sync::mpsc::UnboundedReceiver<WorkerResponse>;
+type CancelSender = tokio::sync::mpsc::UnboundedSender<QueryId>;
+
+struct FullWorker {
+    request_tx: RequestSender,
+    response_rx: ResponseReceiver,
+    cancel_tx: CancelSender,
+    worker_handle: tokio::task::JoinHandle<()>,
+    canceller_handle: tokio::task::JoinHandle<()>,
+}
+
+fn spawn_full_worker(source: Arc<dyn DataSource>) -> FullWorker {
+    let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (cancel_tx, cancel_rx) = tokio::sync::mpsc::unbounded_channel();
+    let worker_handle = worker::spawn(Arc::clone(&source), request_rx, response_tx.clone());
+    let canceller_handle = worker::spawn_canceller(source, cancel_rx, response_tx);
+    FullWorker {
+        request_tx,
+        response_rx,
+        cancel_tx,
+        worker_handle,
+        canceller_handle,
+    }
+}
+
+async fn shutdown_full_worker(
+    request_tx: RequestSender,
+    cancel_tx: CancelSender,
+    worker_handle: tokio::task::JoinHandle<()>,
+    canceller_handle: tokio::task::JoinHandle<()>,
+) {
+    drop(request_tx);
+    drop(cancel_tx);
+    worker_handle.abort();
+    let _ = worker_handle.await;
+    canceller_handle.abort();
+    let _ = canceller_handle.await;
+}
+
+/// Drives one full run (as `App::start_run`/`App::apply_query_response`
+/// would) to completion via the real `RunState` state machine and the real
+/// worker channels: sends the first `QueryRequest`, then for every response
+/// either fires a deferred cancel (`on_started`), advances to the next
+/// statement, or returns once the run is `Done`. Returns every statement's
+/// result in order plus the final summary (`None` only if `plan` was empty,
+/// mirroring `RunState::start`).
+async fn drive_run(
+    request_tx: &tokio::sync::mpsc::UnboundedSender<WorkerRequest>,
+    response_rx: &mut tokio::sync::mpsc::UnboundedReceiver<WorkerResponse>,
+    cancel_tx: &tokio::sync::mpsc::UnboundedSender<QueryId>,
+    plan: Vec<RunUnit>,
+    per_response_timeout: Duration,
+) -> (
+    Vec<Result<QueryOutcome, DataSourceError>>,
+    Option<ratwarren::app::run::RunSummary>,
+) {
+    let mut state = RunState::new();
+    let mut results = Vec::new();
+    let Some(mut req) = state.start(plan) else {
+        return (results, None);
+    };
+    loop {
+        request_tx
+            .send(WorkerRequest::Query(req))
+            .expect("worker task should still be alive to receive the request");
+        loop {
+            let response = tokio::time::timeout(per_response_timeout, response_rx.recv())
+                .await
+                .expect("worker should respond within the timeout")
+                .expect("worker response channel should not close mid-test");
+            let WorkerResponse::Query(q) = response else {
+                continue;
+            };
+            match q {
+                QueryResponse::Started { id, query_id } => {
+                    if let Some(qid) = state.on_started(id, query_id) {
+                        let _ = cancel_tx.send(qid);
+                    }
+                }
+                QueryResponse::Finished { id, result } => {
+                    if !state.owns(id) {
+                        continue;
+                    }
+                    let outcome = state
+                        .on_finished(id, &result)
+                        .expect("owns() was true, so on_finished must not be a no-op");
+                    results.push(result);
+                    match outcome {
+                        RunOutcome::Next(next_req) => {
+                            req = next_req;
+                            break;
+                        }
+                        RunOutcome::Done(summary) => return (results, Some(summary)),
+                    }
+                }
+                QueryResponse::CancelFailed { message } => {
+                    panic!("unexpected CancelFailed: {message}");
+                }
+            }
+        }
+    }
+}
+
+async fn assert_no_further_response_arrives(
+    response_rx: &mut tokio::sync::mpsc::UnboundedReceiver<WorkerResponse>,
+) {
+    // Bounded wait rather than an instantaneous `try_recv`: the worker task
+    // needs at least one scheduler tick (and, in these tests, sometimes an
+    // actual DB round-trip) to notice there's nothing left to send, so an
+    // immediate `try_recv` could spuriously pass even if a bug caused a
+    // stray extra response.
+    let result = tokio::time::timeout(Duration::from_millis(500), response_rx.recv()).await;
+    assert!(
+        result.is_err(),
+        "no further response should have arrived, but one did"
+    );
+}
+
+#[tokio::test]
+async fn full_run_path_cursor_statement_runs_only_the_statement_under_the_cursor() {
+    require_pg!();
+    let ds = connect().await;
+    let source: Arc<dyn DataSource> = Arc::new(ds);
+    let FullWorker {
+        request_tx,
+        mut response_rx,
+        cancel_tx,
+        worker_handle,
+        canceller_handle,
+    } = spawn_full_worker(Arc::clone(&source));
+
+    let text = "SELECT 1;\nSELECT 2;\nSELECT 3;";
+    let mut buf = TextBuffer::from_text(text);
+    // Position the cursor inside the middle statement, "SELECT 2".
+    buf.move_to(
+        ratwarren::editor::Position { line: 1, col: 3 },
+        Motion::Move,
+    );
+    let units = plan_run(&buf, RunTarget::Cursor).expect("cursor sits on a clean statement");
+    assert_eq!(units.len(), 1);
+    assert_eq!(units[0].sql, "SELECT 2");
+
+    let (results, summary) = drive_run(
+        &request_tx,
+        &mut response_rx,
+        &cancel_tx,
+        units,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(results.len(), 1, "only the cursor statement should run");
+    match &results[0] {
+        Ok(QueryOutcome::Rows(page)) => {
+            assert_eq!(page.rows.len(), 1);
+            assert_eq!(page.rows[0][0].as_deref(), Some("2"));
+        }
+        other => panic!("expected QueryOutcome::Rows for SELECT 2, got {other:?}"),
+    }
+    let summary = summary.expect("plan was non-empty");
+    assert_eq!(summary.ran, 1);
+    assert_eq!(summary.total, 1);
+    assert!(!summary.cancelled);
+    assert_eq!(summary.failed, None);
+
+    shutdown_full_worker(request_tx, cancel_tx, worker_handle, canceller_handle).await;
+}
+
+#[tokio::test]
+async fn full_run_path_selection_spanning_two_statements_runs_both_in_order() {
+    require_pg!();
+    let ds = connect().await;
+    let source: Arc<dyn DataSource> = Arc::new(ds);
+    let FullWorker {
+        request_tx,
+        mut response_rx,
+        cancel_tx,
+        worker_handle,
+        canceller_handle,
+    } = spawn_full_worker(Arc::clone(&source));
+
+    let text = "SELECT 1;\nSELECT 2;\nSELECT 3;";
+    let mut buf = TextBuffer::from_text(text);
+    buf.move_to(
+        ratwarren::editor::Position { line: 0, col: 0 },
+        Motion::Move,
+    );
+    // Select through the START of line 2 ("SELECT 3;"): this fully covers
+    // statements 1 and 2 while ending exactly at statement 3's sql_span
+    // start, which `statements_in`'s exclusive overlap check excludes.
+    buf.move_to(
+        ratwarren::editor::Position { line: 2, col: 0 },
+        Motion::Extend,
+    );
+    let units = plan_run(&buf, RunTarget::Selection).expect("selection has no tokenizer error");
+    assert_eq!(units.len(), 2);
+    assert_eq!(units[0].sql, "SELECT 1");
+    assert_eq!(units[1].sql, "SELECT 2");
+
+    let (results, summary) = drive_run(
+        &request_tx,
+        &mut response_rx,
+        &cancel_tx,
+        units,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(results.len(), 2, "statement 3 must never run");
+    for (expected, result) in ["1", "2"].into_iter().zip(&results) {
+        match result {
+            Ok(QueryOutcome::Rows(page)) => {
+                assert_eq!(page.rows[0][0].as_deref(), Some(expected));
+            }
+            other => panic!("expected Rows({expected}), got {other:?}"),
+        }
+    }
+    let summary = summary.expect("plan was non-empty");
+    assert_eq!(summary.ran, 2);
+    assert_eq!(summary.total, 2);
+    assert!(!summary.cancelled);
+    assert_eq!(summary.failed, None);
+    assert_no_further_response_arrives(&mut response_rx).await;
+
+    shutdown_full_worker(request_tx, cancel_tx, worker_handle, canceller_handle).await;
+}
+
+#[tokio::test]
+async fn full_run_path_whole_buffer_runs_mixed_ddl_dml_select_in_order() {
+    require_pg!();
+    let ds = connect().await;
+    let source: Arc<dyn DataSource> = Arc::new(ds);
+    let FullWorker {
+        request_tx,
+        mut response_rx,
+        cancel_tx,
+        worker_handle,
+        canceller_handle,
+    } = spawn_full_worker(Arc::clone(&source));
+
+    let schema = unique_schema("fullrunbuf");
+    {
+        let setup = connect().await;
+        create_schema(&setup, &schema).await;
+    }
+    let q = quote_ident(&schema);
+    let text = format!(
+        "CREATE TABLE {q}.t (i int); INSERT INTO {q}.t VALUES (1),(2),(3); SELECT * FROM {q}.t;"
+    );
+    let buf = TextBuffer::from_text(&text);
+    let units = plan_run(&buf, RunTarget::Buffer).expect("no tokenizer error");
+    assert_eq!(units.len(), 3);
+
+    let (results, summary) = drive_run(
+        &request_tx,
+        &mut response_rx,
+        &cancel_tx,
+        units,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(results.len(), 3);
+    assert!(
+        matches!(
+            &results[0],
+            Ok(QueryOutcome::NoResultSet { rows_affected: 0 })
+        ),
+        "CREATE TABLE has no affected-row count, got {:?}",
+        results[0]
+    );
+    assert!(
+        matches!(
+            &results[1],
+            Ok(QueryOutcome::NoResultSet { rows_affected: 3 })
+        ),
+        "INSERT of 3 rows should report 3 affected, got {:?}",
+        results[1]
+    );
+    match &results[2] {
+        Ok(QueryOutcome::Rows(page)) => assert_eq!(page.rows.len(), 3),
+        other => panic!("expected the trailing SELECT to return Rows, got {other:?}"),
+    }
+    let summary = summary.expect("plan was non-empty");
+    assert_eq!(summary.ran, 3);
+    assert_eq!(summary.total, 3);
+    assert!(!summary.cancelled);
+    assert_eq!(summary.failed, None);
+
+    shutdown_full_worker(request_tx, cancel_tx, worker_handle, canceller_handle).await;
+    let cleanup = connect().await;
+    drop_schema(&cleanup, &schema).await;
+}
+
+#[tokio::test]
+async fn full_run_path_stops_on_the_first_error_and_never_issues_the_third_statement() {
+    require_pg!();
+    let ds = connect().await;
+    let source: Arc<dyn DataSource> = Arc::new(ds);
+    let FullWorker {
+        request_tx,
+        mut response_rx,
+        cancel_tx,
+        worker_handle,
+        canceller_handle,
+    } = spawn_full_worker(Arc::clone(&source));
+
+    let text = "SELECT 1; SELEKT 2; SELECT 3;";
+    let buf = TextBuffer::from_text(text);
+    // The splitter has no idea "SELEKT" isn't a real keyword -- it tokenizes
+    // fine as an ordinary identifier, so all three statements are planned;
+    // the syntax error only surfaces once Postgres actually executes it.
+    let units = plan_run(&buf, RunTarget::Buffer).expect("splitting doesn't validate SQL syntax");
+    assert_eq!(units.len(), 3);
+
+    let (results, summary) = drive_run(
+        &request_tx,
+        &mut response_rx,
+        &cancel_tx,
+        units,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(
+        results.len(),
+        2,
+        "exactly two statements should have been issued: the first (ok) and the second (error)"
+    );
+    match &results[0] {
+        Ok(QueryOutcome::Rows(page)) => assert_eq!(page.rows[0][0].as_deref(), Some("1")),
+        other => panic!("expected statement 1 to succeed, got {other:?}"),
+    }
+    assert!(
+        matches!(&results[1], Err(DataSourceError::Query { .. })),
+        "expected statement 2 to fail with a query error, got {:?}",
+        results[1]
+    );
+    let summary = summary.expect("plan was non-empty");
+    assert_eq!(summary.ran, 2);
+    assert_eq!(summary.total, 3);
+    assert!(!summary.cancelled);
+    assert!(summary.failed.is_some());
+
+    // The third statement was never sent, so nothing further should ever
+    // arrive on the response channel.
+    assert_no_further_response_arrives(&mut response_rx).await;
+
+    shutdown_full_worker(request_tx, cancel_tx, worker_handle, canceller_handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_run_path_cancel_mid_run_stops_the_run_and_never_issues_the_next_statement() {
+    require_pg!();
+    let ds = connect().await;
+    let source: Arc<dyn DataSource> = Arc::new(ds);
+    let FullWorker {
+        request_tx,
+        mut response_rx,
+        cancel_tx,
+        worker_handle,
+        canceller_handle,
+    } = spawn_full_worker(Arc::clone(&source));
+
+    let text = "SELECT pg_sleep(10); SELECT 1;";
+    let buf = TextBuffer::from_text(text);
+    let units = plan_run(&buf, RunTarget::Buffer).expect("no tokenizer error");
+    assert_eq!(units.len(), 2);
+
+    let mut state = RunState::new();
+    let req = state.start(units).expect("plan is non-empty");
+    request_tx
+        .send(WorkerRequest::Query(req))
+        .expect("worker alive");
+
+    // Wait for `Started`, then simulate the user pressing the cancel key:
+    // `RunState::request_cancel` returns the `QueryId` immediately since
+    // it's already known by this point, exactly like `App::on_key`'s
+    // `CancelOrQuit` handling.
+    let started = tokio::time::timeout(Duration::from_secs(5), response_rx.recv())
+        .await
+        .expect("worker should report Started promptly")
+        .expect("channel open");
+    let WorkerResponse::Query(QueryResponse::Started { id, query_id }) = started else {
+        panic!("expected the first response to be Started");
+    };
+    assert!(
+        state.on_started(id, query_id).is_none(),
+        "no cancel was requested yet, so on_started must not fire one"
+    );
+    let qid = state
+        .request_cancel()
+        .expect("the QueryId is already known, so the cancel must fire immediately");
+    cancel_tx.send(qid).expect("canceller task alive");
+
+    let finished = tokio::time::timeout(Duration::from_secs(10), response_rx.recv())
+        .await
+        .expect("worker should report Finished (cancelled) well before pg_sleep(10) elapses")
+        .expect("channel open");
+    let WorkerResponse::Query(QueryResponse::Finished {
+        id: finished_id,
+        result,
+    }) = finished
+    else {
+        panic!("expected the second response to be Finished");
+    };
+    assert!(
+        matches!(result, Err(DataSourceError::Cancelled)),
+        "expected the cancelled statement to fail with DataSourceError::Cancelled, got {result:?}"
+    );
+    let outcome = state
+        .on_finished(finished_id, &result)
+        .expect("this id belongs to the active run");
+    let summary = match outcome {
+        RunOutcome::Done(summary) => summary,
+        RunOutcome::Next(_) => panic!("a cancelled statement must stop the run, not continue"),
+    };
+    assert!(summary.cancelled);
+    assert_eq!(summary.failed, None);
+    assert_eq!(summary.ran, 1);
+    assert_eq!(summary.total, 2);
+
+    // Statement 2 was never sent, so nothing further should arrive.
+    assert_no_further_response_arrives(&mut response_rx).await;
+
+    // The connection must be immediately usable again: a `list_tables`
+    // issued through the very same worker/channels must succeed (possibly
+    // after `retry_on_busy`'s retry while the cancelled query's connection
+    // slot settles), proving no stuck permit from the cancel path.
+    let id = RequestId(12345);
+    request_tx
+        .send(WorkerRequest::Tree(TreeRequest::Tables {
+            id,
+            schema: "public".to_string(),
+        }))
+        .expect("worker alive");
+    let response = tokio::time::timeout(Duration::from_secs(10), response_rx.recv())
+        .await
+        .expect("worker should recover and answer list_tables")
+        .expect("channel open");
+    match response {
+        WorkerResponse::Tree(TreeResponse::Tables { result, .. }) => {
+            assert!(
+                result.is_ok(),
+                "list_tables after a mid-run cancel should succeed, got {result:?}"
+            );
+        }
+        WorkerResponse::Query(_) => panic!("expected a Tree(Tables) response, got a Query one"),
+        WorkerResponse::Grid(_) => panic!("expected a Tree(Tables) response, got a Grid one"),
+        WorkerResponse::Tree(TreeResponse::Schemas { .. } | TreeResponse::Columns { .. }) => {
+            panic!("expected a Tree(Tables) response, got a different Tree response")
+        }
+    }
+
+    shutdown_full_worker(request_tx, cancel_tx, worker_handle, canceller_handle).await;
+}
+
+// The carried-over Phase 7 regression, looped for confidence: `handle_query`'s
+// `finish()`-vs-`drop()` branch must reliably hand an unbounded, only-
+// partially-consumed stream off to the background drain/abandon path instead
+// of blocking the worker, AND the very next statement in the same run must
+// reliably succeed once `retry_on_busy` gets past the transient `Busy` while
+// that drain finishes -- at machine-speed back-to-back statement gaps, not
+// human-speed.
+//
+// FIXED (was previously flaky, root-caused and fixed via the coop-yield +
+// bounded-cancel-retry pass in `drain_abandoned`): root cause, reconstructed
+// from Postgres server logs and confirmed by direct measurement, was that
+// `drain_abandoned`'s drain loop (`while let Some(item) = inner.next().await
+// { ... }`) never yielded to the scheduler -- tokio-postgres's stream has no
+// tokio coop integration and can serve an entire buffered batch of rows per
+// channel item, so the loop stayed inside a single `poll()` for up to ~7s on
+// a large abandoned result set. That starved `tokio::time::timeout(ctx.grace,
+// &mut drain)`'s `Sleep`, which never got polled, so the cancel-escalation
+// fired anywhere from 100ms to 6.9s late (or not at all before the drain
+// finished naturally) -- NOT a `cancel_query()` reliability problem itself
+// (measured 0 failures/timeouts across 150 real `cancel_query()` calls,
+// latency 105-220µs every time). The fix adds `tokio::task::coop::
+// consume_budget().await` inside the drain loop so the timeout actually gets
+// a chance to fire, plus a bounded cancel-retry loop (`AbandonStats` below)
+// for observability.
+//
+// The first version of this test asserted `last_cancel_delay() < 500ms` and
+// failed 4/10 runs against real Postgres -- NOT a regression of the coop-
+// starvation bug above, but `last_cancel_delay_ms` being overwritten by
+// EVERY escalation attempt, so a run that needed a second attempt (a
+// legitimate ~1.13s = 100ms abandon_grace + 1s cancel_escalate + 25ms
+// cancel_settle) was indistinguishable from a genuine regression of the
+// first attempt firing late. Measured across 110+ iterations post-fix
+// (this test plus independent review re-runs), `multi_attempt_abandons()`
+// was 0 every time -- so a second attempt does not appear to be the actual
+// explanation for the original 4/10 failures, and if this test ever shows
+// `multi_attempt_abandons() > 0` alongside a large `first_cancel_delay()`,
+// treat that as a live anomaly worth investigating, not an expected/benign
+// case to relax the bound for. What's certain, independent of that
+// explanation, is that mixing attempt-1 and attempt-2+ delays into one
+// "last delay" metric made a real regression indistinguishable from normal
+// operation -- which is why this test now pins
+// `AbandonStats::first_cancel_delay()` (attempt-1 only, the number the
+// coop-starvation defect actually corrupted) and reports
+// `multi_attempt_abandons()` in failure messages as a diagnostic, without
+// asserting on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_run_path_abandon_and_retry_is_reliable_across_repeated_back_to_back_runs() {
+    require_pg!();
+    let ds = connect().await;
+    let stats = ds.abandon_stats();
+    let source: Arc<dyn DataSource> = Arc::new(ds);
+    let FullWorker {
+        request_tx,
+        mut response_rx,
+        cancel_tx,
+        worker_handle,
+        canceller_handle,
+    } = spawn_full_worker(Arc::clone(&source));
+
+    let text = "SELECT generate_series(1, 100000000); SELECT 1;";
+    let buf = TextBuffer::from_text(text);
+    let units = plan_run(&buf, RunTarget::Buffer).expect("no tokenizer error");
+    assert_eq!(units.len(), 2);
+
+    let mut first_delays: Vec<Duration> = Vec::new();
+
+    for i in 0..10u32 {
+        let first_cancels_before = stats.first_cancels();
+        let outcome = tokio::time::timeout(Duration::from_secs(20), async {
+            let mut state = RunState::new();
+            let mut req = state
+                .start(units.clone())
+                .expect("plan is non-empty on every iteration");
+            let mut received = 0usize;
+            loop {
+                request_tx
+                    .send(WorkerRequest::Query(req))
+                    .unwrap_or_else(|_| panic!("iteration {i}: worker task should still be alive"));
+                loop {
+                    let response = tokio::time::timeout(Duration::from_secs(15), response_rx.recv())
+                        .await
+                        .unwrap_or_else(|_| {
+                            panic!("iteration {i}: worker did not respond within 15s")
+                        })
+                        .unwrap_or_else(|| panic!("iteration {i}: response channel closed"));
+                    let WorkerResponse::Query(q) = response else {
+                        continue;
+                    };
+                    match q {
+                        QueryResponse::Started { id, query_id } => {
+                            let _ = state.on_started(id, query_id);
+                        }
+                        QueryResponse::Finished { id, result } => {
+                            if !state.owns(id) {
+                                continue;
+                            }
+                            received += 1;
+                            if received == 1 {
+                                match &result {
+                                    Ok(QueryOutcome::Rows(page)) => assert!(
+                                        page.has_next,
+                                        "iteration {i}: statement 1 (unbounded) should report has_next"
+                                    ),
+                                    other => panic!(
+                                        "iteration {i}: expected Rows for statement 1, got {other:?}"
+                                    ),
+                                }
+                            } else if received == 2 {
+                                match &result {
+                                    Ok(QueryOutcome::Rows(page)) => {
+                                        assert_eq!(page.rows.len(), 1, "iteration {i}")
+                                    }
+                                    other => panic!(
+                                        "iteration {i}: expected statement 2 to return 1 row, got {other:?}"
+                                    ),
+                                }
+                                // Statement 2's `execute()` only succeeds once
+                                // it acquires the connection permit, which
+                                // `drain_abandoned` (spawned when statement
+                                // 1's stream was dropped) only releases after
+                                // it fully resolves -- so by this point the
+                                // abandon/cancel-escalation for statement 1
+                                // is guaranteed to have already run to
+                                // completion, race-free.
+                                let first_cancels_after = stats.first_cancels();
+                                if first_cancels_after == first_cancels_before {
+                                    // The drain finished inside abandon_grace,
+                                    // so no cancel was issued this iteration
+                                    // and first_cancel_delay() still holds an
+                                    // earlier iteration's value. Skipping
+                                    // beats asserting on a stale number
+                                    // (that's the exact class of bug this
+                                    // test is being fixed for). Guarded by
+                                    // the !first_delays.is_empty() assertion
+                                    // after the loop.
+                                } else {
+                                    assert_eq!(
+                                        first_cancels_after,
+                                        first_cancels_before + 1,
+                                        "iteration {i}: expected exactly one abandon to have \
+                                         issued a first cancel"
+                                    );
+                                    let delay = stats.first_cancel_delay();
+                                    first_delays.push(delay);
+                                    assert!(
+                                        delay < Duration::from_millis(300),
+                                        "iteration {i}: the FIRST cancel attempt fired {delay:?} \
+                                         after abandon, expected ~100ms (abandon_grace) -- a \
+                                         value in the hundreds of ms to seconds is the \
+                                         coop-starvation regression this test exists for. \
+                                         Escalation attempts 2+ are NOT measured here by design. \
+                                         diagnostics: multi_attempt_abandons={} of {} abandons, \
+                                         cancel_send_failures={}, cancel_timeouts={}",
+                                        stats.multi_attempt_abandons(),
+                                        stats.abandons(),
+                                        stats.cancel_send_failures(),
+                                        stats.cancel_timeouts(),
+                                    );
+                                }
+                                assert_eq!(
+                                    stats.cancel_gave_up(),
+                                    0,
+                                    "iteration {i}: cancel escalation exhausted all attempts and \
+                                     fell back to an unbounded natural drain \
+                                     (send_failures={}, timeouts={})",
+                                    stats.cancel_send_failures(),
+                                    stats.cancel_timeouts(),
+                                );
+                            }
+                            let out = state
+                                .on_finished(id, &result)
+                                .expect("owns() was true, so this must not be a no-op");
+                            match out {
+                                RunOutcome::Next(next_req) => {
+                                    req = next_req;
+                                    break;
+                                }
+                                RunOutcome::Done(summary) => {
+                                    assert_eq!(summary.ran, 2, "iteration {i}");
+                                    assert_eq!(summary.total, 2, "iteration {i}");
+                                    assert!(!summary.cancelled, "iteration {i}");
+                                    assert_eq!(summary.failed, None, "iteration {i}");
+                                    return;
+                                }
+                            }
+                        }
+                        QueryResponse::CancelFailed { message } => {
+                            panic!("iteration {i}: unexpected CancelFailed: {message}")
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+        outcome.unwrap_or_else(|_| panic!("iteration {i} timed out after 20s"));
+    }
+
+    assert!(
+        !first_delays.is_empty(),
+        "no iteration ever issued a first cancel -- the 100M-row abandon is supposed to outlive \
+         abandon_grace every time, so this test is no longer exercising the escalation path it \
+         was written for"
+    );
+
+    shutdown_full_worker(request_tx, cancel_tx, worker_handle, canceller_handle).await;
 }

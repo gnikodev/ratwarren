@@ -43,19 +43,22 @@ async fn main() -> ExitCode {
 
     let pg = Arc::new(source);
     let worker_source: Arc<dyn DataSource> = pg.clone();
+    let canceller_source: Arc<dyn DataSource> = pg.clone();
 
     let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
     let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel();
-    let worker_handle = app::worker::spawn(worker_source, request_rx, response_tx);
+    let (cancel_tx, cancel_rx) = tokio::sync::mpsc::unbounded_channel();
+    let worker_handle = app::worker::spawn(worker_source, request_rx, response_tx.clone());
+    let canceller_handle = app::worker::spawn_canceller(canceller_source, cancel_rx, response_tx);
 
     let mut terminal = ratatui::init();
-    let mut app = App::new(name, request_tx, response_rx);
+    let mut app = App::new(name, request_tx, response_rx, cancel_tx);
     let result = app::run(&mut terminal, &mut app).await;
     ratatui::restore();
 
-    // `app` owns the last clone of `request_tx` outside the worker task
-    // itself; drop it explicitly so the worker's `requests.recv().await`
-    // loop observes the channel close.
+    // `app` owns the last clone of `request_tx`/`cancel_tx` outside the
+    // worker/canceller tasks themselves; drop it explicitly so their
+    // `recv().await` loops observe the channel close.
     drop(app);
 
     // The worker only notices the channel closing *after* its current
@@ -67,9 +70,13 @@ async fn main() -> ExitCode {
     // consumes its response after quit anyway. `worker_handle.await`
     // resolves promptly once the task notices the abort at its next await
     // point, which drops its `Arc<dyn DataSource>` clone — a precondition
-    // for `Arc::into_inner` below to succeed.
+    // for `Arc::into_inner` below to succeed. The canceller task holds its
+    // own separate `Arc<dyn DataSource>` clone and must be aborted/awaited
+    // the same way before that precondition holds.
     worker_handle.abort();
     let _ = worker_handle.await;
+    canceller_handle.abort();
+    let _ = canceller_handle.await;
 
     // `None` only if something above still holds a clone; the tunnel's own
     // Drop impl reaps the ssh child regardless, so that case is safe to skip.

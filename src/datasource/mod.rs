@@ -92,6 +92,14 @@ pub enum DataSourceError {
     #[error("connection {name:?} is busy with another query")]
     Busy { name: String },
     #[error(
+        "connection {name:?}: could not start — a previous query is still being cleaned up \
+         (gave up waiting after {waited:?})"
+    )]
+    BusyTimedOut {
+        name: String,
+        waited: std::time::Duration,
+    },
+    #[error(
         "requires a single SQL statement; the server executed more than one and the extra results were discarded"
     )]
     MultipleStatements,
@@ -134,5 +142,18 @@ impl DataSourceError {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+impl QueryId {
+    /// `QueryId`'s field is private outside this module by design (nothing
+    /// should be able to forge one to send a bogus cancel). `RunState`
+    /// (`src/app/run.rs`) needs a real value to unit-test its
+    /// cancel-before-vs-after-`on_started` sequencing without spinning up a
+    /// real `DataSource` -- narrowest seam that allows that: `pub(crate)`,
+    /// gated out of non-test builds entirely.
+    pub(crate) fn for_test(id: u64) -> Self {
+        QueryId(id)
     }
 }

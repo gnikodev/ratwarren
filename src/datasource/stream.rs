@@ -91,6 +91,12 @@ impl RowStream {
             if matches!(self.state, StreamState::Ended | StreamState::Aborted) {
                 return None;
             }
+            // Defensive, not fixing a live bug today (see drain_abandoned in
+            // postgres.rs for the confirmed one): tokio-postgres's stream has
+            // no tokio coop integration and can serve a large buffered batch
+            // out of one poll(), which would stall the whole ratatui event
+            // loop on the project's actual 2-core-VPS target hardware.
+            tokio::task::coop::consume_budget().await;
             match self.inner.next().await {
                 Some(Ok(ResultMessage::Ignored)) => continue,
                 Some(Ok(ResultMessage::Columns(columns))) => match self.state {
@@ -178,6 +184,8 @@ impl RowStream {
                 if item.is_err() {
                     break;
                 }
+                // Defensive, see the identical comment in RowStream::next().
+                tokio::task::coop::consume_budget().await;
             }
             self.state = StreamState::Ended;
             self.clear_active();
