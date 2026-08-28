@@ -69,6 +69,7 @@ fn env_or(name: &str, default: &str) -> String {
 fn test_connection() -> Connection {
     Connection {
         name: "ratwarren-test".to_string(),
+        group: None,
         host: env_or("RATWARREN_TEST_PG_HOST", "127.0.0.1"),
         port: env_or("RATWARREN_TEST_PG_PORT", "5432")
             .parse()

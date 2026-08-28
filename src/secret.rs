@@ -187,6 +187,7 @@ mod tests {
     fn connection_without_password() -> Connection {
         Connection {
             name: "test".to_string(),
+            group: None,
             host: "localhost".to_string(),
             port: 5432,
             database: "app".to_string(),

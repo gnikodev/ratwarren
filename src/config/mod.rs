@@ -21,6 +21,10 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct Connection {
     pub name: String,
+    // Flat label only — no nesting, no path syntax. Grouping is byte-exact
+    // string equality; see Config::grouped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     // Address of Postgres as seen by whoever opens the TCP connection:
     // this machine when `tunnel` is None, the bastion when it is Some.
     pub host: String,
@@ -32,6 +36,14 @@ pub struct Connection {
     pub password: Option<SecretRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel: Option<SshTunnel>,
+}
+
+/// A view over `Config::connections`, never serialized. `label` is None for
+/// connections with no `group` key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionGroup<'a> {
+    pub label: Option<&'a str>,
+    pub connections: Vec<&'a Connection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +223,32 @@ impl Config {
     pub fn connection(&self, name: &str) -> Option<&Connection> {
         self.connections.iter().find(|c| c.name == name)
     }
+
+    /// Connections bucketed by `group`, ready to render top-to-bottom with no
+    /// further ordering logic.
+    ///
+    /// Bucket order is first appearance in the file, treating "no group" as an
+    /// ordinary bucket key: the ungrouped bucket appears where its first
+    /// ungrouped connection appears, not pinned to the top or bottom. Member
+    /// order within a bucket is file order. Group labels compare byte-exact —
+    /// no trimming, no case folding. An empty `connections` list yields an
+    /// empty Vec.
+    pub fn grouped(&self) -> Vec<ConnectionGroup<'_>> {
+        let mut groups: Vec<ConnectionGroup<'_>> = Vec::new();
+
+        for connection in &self.connections {
+            let label = connection.group.as_deref();
+            match groups.iter_mut().find(|g| g.label == label) {
+                Some(group) => group.connections.push(connection),
+                None => groups.push(ConnectionGroup {
+                    label,
+                    connections: vec![connection],
+                }),
+            }
+        }
+
+        groups
+    }
 }
 
 impl Connection {
@@ -231,6 +269,14 @@ impl Connection {
 
         if self.name.trim().is_empty() {
             return Err(empty_field("name"));
+        }
+        // Whitespace-only is rejected, but leading/trailing whitespace on an
+        // otherwise non-empty label (e.g. " prod ") is accepted as-is and is
+        // distinct from "prod" — trimming/normalizing labels is out of scope.
+        if let Some(group) = &self.group
+            && group.trim().is_empty()
+        {
+            return Err(empty_field("group"));
         }
         if self.host.trim().is_empty() {
             return Err(empty_field("host"));
@@ -340,6 +386,7 @@ mod tests {
     fn full_connection() -> Connection {
         Connection {
             name: "prod".to_string(),
+            group: Some("production".to_string()),
             host: "db.internal".to_string(),
             port: 6543,
             database: "app".to_string(),
@@ -358,6 +405,7 @@ mod tests {
     fn minimal_connection() -> Connection {
         Connection {
             name: "local".to_string(),
+            group: None,
             host: "localhost".to_string(),
             port: DEFAULT_POSTGRES_PORT,
             database: "app".to_string(),
@@ -389,6 +437,311 @@ mod tests {
         let parsed = Config::parse_toml(&text).expect("round-tripped TOML parses");
 
         assert_eq!(parsed, config);
+    }
+
+    #[test]
+    fn pre_grouping_config_parses_and_reserializes_without_a_group_key() {
+        let text = r#"
+            [[connections]]
+            name = "local"
+            host = "localhost"
+            database = "app"
+            user = "app_user"
+        "#;
+
+        let config = Config::parse_toml(text).expect("pre-grouping config is valid");
+        let reserialized = config.to_toml().expect("valid config serializes");
+
+        assert!(!reserialized.contains("group"));
+
+        let reparsed = Config::parse_toml(&reserialized).expect("reserialized TOML parses");
+        assert_eq!(reparsed, config);
+    }
+
+    #[test]
+    fn omitted_group_parses_as_none() {
+        let text = r#"
+            [[connections]]
+            name = "local"
+            host = "localhost"
+            database = "app"
+            user = "app_user"
+        "#;
+
+        let config = Config::parse_toml(text).expect("group is optional");
+
+        assert!(config.connections[0].group.is_none());
+    }
+
+    #[test]
+    fn non_string_group_is_rejected_as_a_type_error() {
+        let text = r#"
+            [[connections]]
+            name = "local"
+            host = "localhost"
+            database = "app"
+            user = "app_user"
+            group = 3
+        "#;
+
+        let err = Config::parse_toml(text).expect_err("group must be a string, not a number");
+        assert!(matches!(err, ConfigError::Parse(_)));
+    }
+
+    fn connection_with_group(name: &str, group: Option<&str>) -> Connection {
+        let mut connection = minimal_connection();
+        connection.name = name.to_string();
+        connection.group = group.map(str::to_string);
+        connection
+    }
+
+    #[test]
+    fn grouped_orders_buckets_by_first_appearance() {
+        let a = connection_with_group("a", Some("group1"));
+        let b = connection_with_group("b", None);
+        let c = connection_with_group("c", Some("group2"));
+        let d = connection_with_group("d", Some("group1"));
+
+        let config = Config {
+            connections: vec![a.clone(), b.clone(), c.clone(), d.clone()],
+        };
+
+        let groups = config.grouped();
+        let labels: Vec<Option<&str>> = groups.iter().map(|g| g.label).collect();
+        assert_eq!(labels, vec![Some("group1"), None, Some("group2")]);
+
+        let group1 = groups
+            .iter()
+            .find(|g| g.label == Some("group1"))
+            .expect("group1 present");
+        assert_eq!(group1.connections, vec![&a, &d]);
+    }
+
+    // The other ordering tests build `Config { connections: vec![...] }` by
+    // hand, which never exercises whether TOML array-of-tables document order
+    // actually survives deserialization into that same `Vec` order -- that
+    // link is `grouped()`'s entire documented contract, so it needs at least
+    // one test that goes through `parse_toml` rather than a hand-built `Vec`.
+    #[test]
+    fn grouped_orders_by_document_order_through_parse_toml() {
+        let text = r#"
+            [[connections]]
+            name = "a"
+            group = "group1"
+            host = "h"
+            database = "d"
+            user = "u"
+
+            [[connections]]
+            name = "b"
+            host = "h"
+            database = "d"
+            user = "u"
+
+            [[connections]]
+            name = "c"
+            group = "group2"
+            host = "h"
+            database = "d"
+            user = "u"
+
+            [[connections]]
+            name = "d"
+            group = "group1"
+            host = "h"
+            database = "d"
+            user = "u"
+        "#;
+
+        let config = Config::parse_toml(text).expect("valid config");
+        let groups = config.grouped();
+        let labels: Vec<Option<&str>> = groups.iter().map(|g| g.label).collect();
+        assert_eq!(labels, vec![Some("group1"), None, Some("group2")]);
+
+        let group1 = groups
+            .iter()
+            .find(|g| g.label == Some("group1"))
+            .expect("group1 present");
+        let names: Vec<&str> = group1.connections.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "d"]);
+    }
+
+    #[test]
+    fn grouped_places_the_ungrouped_bucket_at_its_first_appearance() {
+        let a = connection_with_group("a", None);
+        let b = connection_with_group("b", Some("group1"));
+
+        let config = Config {
+            connections: vec![a, b],
+        };
+
+        let groups = config.grouped();
+        assert_eq!(groups[0].label, None);
+    }
+
+    #[test]
+    fn grouped_is_empty_for_a_config_with_no_connections() {
+        let config = Config::default();
+
+        assert!(config.grouped().is_empty());
+    }
+
+    #[test]
+    fn grouped_treats_labels_as_byte_exact() {
+        let a = connection_with_group("a", Some("prod"));
+        let b = connection_with_group("b", Some("Prod"));
+
+        let config = Config {
+            connections: vec![a, b],
+        };
+
+        let groups = config.grouped();
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn grouped_single_connection_with_a_group_is_its_own_bucket() {
+        let a = connection_with_group("a", Some("solo"));
+
+        let config = Config {
+            connections: vec![a.clone()],
+        };
+
+        let groups = config.grouped();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].label, Some("solo"));
+        assert_eq!(groups[0].connections, vec![&a]);
+    }
+
+    #[test]
+    fn grouped_puts_all_connections_sharing_one_group_in_a_single_bucket() {
+        let a = connection_with_group("a", Some("shared"));
+        let b = connection_with_group("b", Some("shared"));
+        let c = connection_with_group("c", Some("shared"));
+
+        let config = Config {
+            connections: vec![a.clone(), b.clone(), c.clone()],
+        };
+
+        let groups = config.grouped();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].label, Some("shared"));
+        assert_eq!(groups[0].connections, vec![&a, &b, &c]);
+    }
+
+    #[test]
+    fn grouped_does_not_confuse_a_group_label_with_a_connections_name() {
+        // "alpha" is a connection *name* here, not a group. A second
+        // connection's *group* happens to be the literal string "alpha".
+        // Confirm the two fields are never cross-matched.
+        let alpha_named = connection_with_group("alpha", None);
+        let beta_grouped_alpha = connection_with_group("beta", Some("alpha"));
+
+        let config = Config {
+            connections: vec![alpha_named.clone(), beta_grouped_alpha.clone()],
+        };
+
+        let groups = config.grouped();
+        assert_eq!(groups.len(), 2);
+
+        let ungrouped = groups
+            .iter()
+            .find(|g| g.label.is_none())
+            .expect("ungrouped bucket present");
+        assert_eq!(ungrouped.connections, vec![&alpha_named]);
+
+        let alpha_group = groups
+            .iter()
+            .find(|g| g.label == Some("alpha"))
+            .expect("\"alpha\" group present");
+        assert_eq!(alpha_group.connections, vec![&beta_grouped_alpha]);
+    }
+
+    #[test]
+    fn grouped_handles_a_long_alternating_sequence_without_off_by_one_errors() {
+        let connections: Vec<Connection> = vec![
+            connection_with_group("c0", Some("g1")),
+            connection_with_group("c1", None),
+            connection_with_group("c2", Some("g2")),
+            connection_with_group("c3", Some("g1")),
+            connection_with_group("c4", None),
+            connection_with_group("c5", Some("g3")),
+            connection_with_group("c6", Some("g2")),
+            connection_with_group("c7", None),
+            connection_with_group("c8", Some("g1")),
+        ];
+
+        let config = Config {
+            connections: connections.clone(),
+        };
+
+        let groups = config.grouped();
+        let labels: Vec<Option<&str>> = groups.iter().map(|g| g.label).collect();
+        assert_eq!(labels, vec![Some("g1"), None, Some("g2"), Some("g3")]);
+
+        let names_for = |label: Option<&str>| -> Vec<&str> {
+            groups
+                .iter()
+                .find(|g| g.label == label)
+                .expect("group present")
+                .connections
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect()
+        };
+
+        assert_eq!(names_for(Some("g1")), vec!["c0", "c3", "c8"]);
+        assert_eq!(names_for(None), vec!["c1", "c4", "c7"]);
+        assert_eq!(names_for(Some("g2")), vec!["c2", "c6"]);
+        assert_eq!(names_for(Some("g3")), vec!["c5"]);
+    }
+
+    #[test]
+    fn grouped_does_not_assume_its_input_has_been_validated() {
+        // Bypasses `validate()` entirely via direct struct construction —
+        // an empty-string group could never reach `grouped()` through
+        // `parse_toml`/`to_toml`, but `grouped()` takes a `&Config`
+        // directly and must not panic or misbehave if called on one that
+        // was never validated.
+        let a = connection_with_group("a", Some(""));
+        let b = connection_with_group("b", Some(""));
+        let c = connection_with_group("c", None);
+
+        let config = Config {
+            connections: vec![a.clone(), b.clone(), c.clone()],
+        };
+
+        let groups = config.grouped();
+        let labels: Vec<Option<&str>> = groups.iter().map(|g| g.label).collect();
+        assert_eq!(labels, vec![Some(""), None]);
+        assert_eq!(groups[0].connections, vec![&a, &b]);
+        assert_eq!(groups[1].connections, vec![&c]);
+    }
+
+    #[test]
+    fn connection_group_equality_is_sensitive_to_member_order() {
+        let a = minimal_connection();
+        let mut b = minimal_connection();
+        b.name = "other".to_string();
+
+        let forward = ConnectionGroup {
+            label: Some("g"),
+            connections: vec![&a, &b],
+        };
+        let reversed = ConnectionGroup {
+            label: Some("g"),
+            connections: vec![&b, &a],
+        };
+        let same_order = ConnectionGroup {
+            label: Some("g"),
+            connections: vec![&a, &b],
+        };
+
+        assert_ne!(
+            forward, reversed,
+            "PartialEq must be order-sensitive, not set-equality"
+        );
+        assert_eq!(forward, same_order);
     }
 
     #[test]
@@ -490,6 +843,28 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_duplicate_names_across_different_groups() {
+        let mut a = minimal_connection();
+        a.name = "dup".to_string();
+        a.group = Some("group1".to_string());
+        let mut b = full_connection();
+        b.name = "dup".to_string();
+        b.group = Some("group2".to_string());
+
+        let config = Config {
+            connections: vec![a, b],
+        };
+
+        let err = config
+            .validate()
+            .expect_err("duplicate names across different groups are invalid");
+        assert!(matches!(
+            err,
+            ConfigError::DuplicateConnectionName { name } if name == "dup"
+        ));
+    }
+
+    #[test]
     fn validate_rejects_empty_name() {
         let mut connection = minimal_connection();
         connection.name = "  ".to_string();
@@ -499,6 +874,38 @@ mod tests {
 
         let err = config.validate().expect_err("empty name is invalid");
         assert!(matches!(err, ConfigError::EmptyField { field: "name", .. }));
+    }
+
+    #[test]
+    fn validate_rejects_empty_group() {
+        let mut connection = minimal_connection();
+        connection.group = Some("".to_string());
+        let config = Config {
+            connections: vec![connection],
+        };
+
+        let err = config.validate().expect_err("empty group is invalid");
+        assert!(matches!(
+            err,
+            ConfigError::EmptyField { field: "group", .. }
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_whitespace_only_group() {
+        let mut connection = minimal_connection();
+        connection.group = Some("  ".to_string());
+        let config = Config {
+            connections: vec![connection],
+        };
+
+        let err = config
+            .validate()
+            .expect_err("whitespace-only group is invalid");
+        assert!(matches!(
+            err,
+            ConfigError::EmptyField { field: "group", .. }
+        ));
     }
 
     #[test]
