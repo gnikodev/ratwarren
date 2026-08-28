@@ -1,5 +1,6 @@
-use crate::app::message::{WorkerRequest, WorkerResponse};
+use crate::app::message::{SessionResponse, WorkerRequest, WorkerResponse};
 use crate::app::run::{CancelRequest, QueryOutcome, QueryRequest, QueryResponse};
+use crate::app::session::SessionId;
 use crate::datasource::{self, DataSource, DataSourceError};
 use crate::ui::grid::message::{GridRequest, GridResponse};
 use crate::ui::grid::page;
@@ -55,14 +56,18 @@ where
 // task (`spawn_canceller`) precisely so it can interrupt this worker while
 // it's blocked awaiting a long-running query.
 pub fn spawn(
+    session: SessionId,
     source: std::sync::Arc<dyn DataSource>,
     mut requests: tokio::sync::mpsc::UnboundedReceiver<WorkerRequest>,
-    responses: tokio::sync::mpsc::UnboundedSender<WorkerResponse>,
+    responses: tokio::sync::mpsc::UnboundedSender<SessionResponse>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(req) = requests.recv().await {
-            let response = handle(&*source, req, &responses).await;
-            if responses.send(response).is_err() {
+            let response = handle(session, &*source, req, &responses).await;
+            if responses
+                .send(SessionResponse { session, response })
+                .is_err()
+            {
                 break;
             }
         }
@@ -75,32 +80,37 @@ pub fn spawn(
 /// design — it only uses `start_gate`, no `try_acquire`), so it can never
 /// itself deadlock against the worker holding the permit.
 pub fn spawn_canceller(
+    session: SessionId,
     source: std::sync::Arc<dyn DataSource>,
     mut cancels: tokio::sync::mpsc::UnboundedReceiver<CancelRequest>,
-    responses: tokio::sync::mpsc::UnboundedSender<WorkerResponse>,
+    responses: tokio::sync::mpsc::UnboundedSender<SessionResponse>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(req) = cancels.recv().await {
             if let Err(e) = source.cancel(req.query_id).await {
-                let _ = responses.send(WorkerResponse::Query(QueryResponse::CancelFailed {
-                    id: req.id,
-                    message: crate::ui::error_chain(&e),
-                }));
+                let _ = responses.send(SessionResponse {
+                    session,
+                    response: WorkerResponse::Query(QueryResponse::CancelFailed {
+                        id: req.id,
+                        message: crate::ui::error_chain(&e),
+                    }),
+                });
             }
         }
     })
 }
 
 async fn handle(
+    session: SessionId,
     source: &dyn DataSource,
     request: WorkerRequest,
-    responses: &tokio::sync::mpsc::UnboundedSender<WorkerResponse>,
+    responses: &tokio::sync::mpsc::UnboundedSender<SessionResponse>,
 ) -> WorkerResponse {
     match request {
         WorkerRequest::Tree(req) => WorkerResponse::Tree(handle_tree(source, req).await),
         WorkerRequest::Grid(req) => WorkerResponse::Grid(handle_grid(source, req).await),
         WorkerRequest::Query(req) => {
-            WorkerResponse::Query(handle_query(source, req, responses).await)
+            WorkerResponse::Query(handle_query(session, source, req, responses).await)
         }
     }
 }
@@ -174,9 +184,10 @@ pub async fn fetch_page(
 }
 
 async fn handle_query(
+    session: SessionId,
     source: &dyn DataSource,
     request: QueryRequest,
-    responses: &tokio::sync::mpsc::UnboundedSender<WorkerResponse>,
+    responses: &tokio::sync::mpsc::UnboundedSender<SessionResponse>,
 ) -> QueryResponse {
     let QueryRequest { id, sql } = request;
 
@@ -184,10 +195,13 @@ async fn handle_query(
         Ok(s) => s,
         Err(e) => return QueryResponse::Finished { id, result: Err(e) },
     };
-    let _ = responses.send(WorkerResponse::Query(QueryResponse::Started {
-        id,
-        query_id: stream.query_id(),
-    }));
+    let _ = responses.send(SessionResponse {
+        session,
+        response: WorkerResponse::Query(QueryResponse::Started {
+            id,
+            query_id: stream.query_id(),
+        }),
+    });
 
     let taken = stream.take(page::FETCH_LIMIT).await;
     let result = match taken {
