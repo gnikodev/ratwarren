@@ -3,19 +3,26 @@ use std::net::Ipv6Addr;
 use super::{LOCAL_BIND_ADDR, TunnelSpec};
 
 pub(crate) fn ssh_argv(spec: &TunnelSpec, local_port: u16) -> Vec<String> {
-    // These are the only `-o` overrides this tool ever forces onto the argv —
-    // everything else (ciphers, keepalives, ProxyJump/ProxyCommand chains,
-    // identity files, ...) is left to the user's ~/.ssh/config, per the
-    // project's ssh-tunnel non-negotiable. ExitOnForwardFailure=yes makes ssh
-    // exit immediately (instead of running degraded) if the -L forward can't
-    // be established, which is what lets the bind-failure retry loop above
-    // detect a lost port race quickly. BatchMode=yes disables passphrase and
-    // host-key prompts: this is a fullscreen TUI with stdin set to /dev/null
-    // and no way to relay an interactive prompt to the user. This is a
-    // deliberate MVP0 tradeoff, not an oversight — a user whose key has a
-    // passphrase and isn't loaded in ssh-agent will see a fast "Permission
-    // denied" failure instead of a hang waiting on a prompt nobody can answer.
+    // `-v`, the two `-o` overrides, and `-N` are the only flags this tool
+    // ever forces onto the argv — everything else (ciphers, keepalives,
+    // ProxyJump/ProxyCommand chains, identity files, ...) is left to the
+    // user's ~/.ssh/config, per the project's ssh-tunnel non-negotiable.
+    // ExitOnForwardFailure=yes makes ssh exit immediately (instead of running
+    // degraded) if the -L forward can't be established, which is what lets
+    // the bind-failure retry loop above detect a lost port race quickly.
+    // BatchMode=yes disables passphrase and host-key prompts: this is a
+    // fullscreen TUI with stdin set to /dev/null and no way to relay an
+    // interactive prompt to the user. This is a deliberate MVP0 tradeoff, not
+    // an oversight — a user whose key has a passphrase and isn't loaded in
+    // ssh-agent will see a fast "Permission denied" failure instead of a hang
+    // waiting on a prompt nobody can answer. `-v` (verbose) is what makes
+    // OpenSSH emit `debug1: Local forwarding listening on ... port N.` once
+    // its `-L` listener is actually bound — the only authoritative,
+    // in-process signal that this ssh (and not some other process reusing
+    // the same just-freed ephemeral port) owns the forward; see
+    // `Tunnel::forward_confirmed`.
     let mut argv = vec![
+        "-v".to_string(),
         "-N".to_string(),
         "-o".to_string(),
         "ExitOnForwardFailure=yes".to_string(),
@@ -86,6 +93,7 @@ mod tests {
         assert_eq!(
             spec.ssh_argv(40000),
             vec![
+                "-v".to_string(),
                 "-N".to_string(),
                 "-o".to_string(),
                 "ExitOnForwardFailure=yes".to_string(),
@@ -107,6 +115,7 @@ mod tests {
         assert_eq!(
             spec.ssh_argv(40000),
             vec![
+                "-v".to_string(),
                 "-N".to_string(),
                 "-o".to_string(),
                 "ExitOnForwardFailure=yes".to_string(),
@@ -137,6 +146,7 @@ mod tests {
         assert_eq!(
             argv,
             vec![
+                "-v".to_string(),
                 "-N".to_string(),
                 "-o".to_string(),
                 "ExitOnForwardFailure=yes".to_string(),
@@ -184,7 +194,7 @@ mod tests {
         let o_count = argv.iter().filter(|s| s.as_str() == "-o").count();
         assert_eq!(o_count, 2);
 
-        let known_flags = ["-N", "-o", "-L", "-p"];
+        let known_flags = ["-v", "-N", "-o", "-L", "-p"];
         let known_flag_values = [
             "ExitOnForwardFailure=yes",
             "BatchMode=yes",

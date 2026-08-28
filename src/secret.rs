@@ -1,10 +1,15 @@
-use std::sync::mpsc;
 use std::time::Duration;
 
 pub const PASSWORD_ENV_VAR: &str = "RATWARREN_PASSWORD";
 
 const KEYRING_NOTICE_AFTER: Duration = Duration::from_secs(3);
 const KEYRING_GIVE_UP_AFTER: Duration = Duration::from_secs(60);
+
+/// Where the async keyring path (`resolve_with_async`) sends progress notes
+/// that would otherwise have gone to stderr -- routed instead to the
+/// session's `Connecting` label so they never land on the alternate screen.
+/// See `app::session::OpenEvent::Progress`.
+pub type NoteSink = dyn Fn(String) + Send + Sync;
 
 pub enum Resolved {
     FromEnv(String),

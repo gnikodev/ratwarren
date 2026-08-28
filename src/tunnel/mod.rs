@@ -5,6 +5,7 @@ use std::io::BufRead;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,12 +13,24 @@ pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(15);
 pub const DEFAULT_PROBE_INTERVAL: Duration = Duration::from_millis(50);
 pub const DEFAULT_PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 pub const DEFAULT_PORT_ATTEMPTS: u32 = 3;
+pub const DEFAULT_FORWARD_CONFIRM_GRACE: Duration = Duration::from_secs(2);
 pub const STDERR_CAPTURE_LIMIT: usize = 8 * 1024;
 pub const LOCAL_BIND_ADDR: Ipv4Addr = Ipv4Addr::LOCALHOST;
 
-// How long to wait for a lost-bind-race ssh to have exited before trusting a
-// successful TCP probe (see wait_ready).
-const READY_SETTLE_DELAY: Duration = Duration::from_millis(20);
+// Serializes `ssh -L` spawns process-wide. Rationale: `reserve_local_port`
+// frees its port before ssh binds it, and OpenSSH only binds the `-L`
+// listener strictly after authenticating (a full TCP + KEX + auth round
+// trip), so with two opens in flight both can legitimately be handed the
+// same free port and the loser then observes the winner's listener and
+// reports ready against the wrong VPS. Holding this across a whole open
+// means the previous tunnel's listener is already live when the next
+// `bind(0)` runs, and `bind(0)` never returns a port with a live listener —
+// which reduces N concurrent tunnels to the already-handled single-tunnel
+// case. Must be a `tokio::sync::Mutex`, not `std::sync::Mutex`: the guard is
+// held across an `.await` that can last seconds (up to `ready_timeout` per
+// queued tunnel).
+pub static OPEN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 // How long to wait, before ever spawning ssh, when checking whether a
 // just-reserved local port is already held by something else (see
 // open_with). Short because this only needs to catch an already-listening
@@ -153,6 +166,10 @@ pub struct TunnelOptions {
     pub probe_interval: Duration,
     pub probe_connect_timeout: Duration,
     pub port_attempts: u32,
+    // How long, after the TCP probe first succeeds, to keep waiting for
+    // ssh's own "Local forwarding listening on ... port N." confirmation
+    // line before accepting readiness unconfirmed. See `Tunnel::wait_ready`.
+    pub forward_confirm_grace: Duration,
 }
 
 impl Default for TunnelOptions {
@@ -163,6 +180,7 @@ impl Default for TunnelOptions {
             probe_interval: DEFAULT_PROBE_INTERVAL,
             probe_connect_timeout: DEFAULT_PROBE_CONNECT_TIMEOUT,
             port_attempts: DEFAULT_PORT_ATTEMPTS,
+            forward_confirm_grace: DEFAULT_FORWARD_CONFIRM_GRACE,
         }
     }
 }
@@ -176,6 +194,16 @@ struct StderrCapture {
 impl StderrCapture {
     fn push_line(&mut self, line: &str) {
         if self.truncated {
+            return;
+        }
+        // `-v` (T2) makes ssh emit a large volume of `debug1:`/`debug2:`/
+        // `debug3:`-prefixed lines. Per F4, every diagnostic the error paths
+        // below depend on (bind failures, `Permission denied`, `Could not
+        // request local forwarding`) is printed at default verbosity with no
+        // `debug` prefix, so dropping these here keeps that noise out of the
+        // 8 KB head-retained budget without losing anything `is_forward_bind_
+        // failure`/`stderr_suffix` needs.
+        if line.trim_start().starts_with("debug") {
             return;
         }
 
@@ -219,6 +247,7 @@ pub struct Tunnel {
     local_port: u16,
     stderr: Arc<Mutex<StderrCapture>>,
     reader: Option<std::thread::JoinHandle<()>>,
+    forward_confirmed: Arc<AtomicBool>,
 }
 
 impl Tunnel {
@@ -290,9 +319,9 @@ impl Tunnel {
             .stderr(Stdio::piped())
             // why: the ssh child (and anything its ~/.ssh/config tells it to
             // exec, e.g. a ProxyCommand/Match-exec/LocalCommand) must never
-            // see the DB password `secret::resolve` already put in this
-            // process's environment for connecting to Postgres -- it has no
-            // legitimate use for it, and ratwarren can't vet what a
+            // see the DB password already sitting in this process's
+            // environment (RATWARREN_PASSWORD) for connecting to Postgres --
+            // it has no legitimate use for it, and ratwarren can't vet what a
             // ProxyCommand does with its environment (log it, crash-dump it,
             // etc).
             .env_remove(crate::secret::PASSWORD_ENV_VAR)
@@ -304,8 +333,10 @@ impl Tunnel {
 
         let stderr = Arc::new(Mutex::new(StderrCapture::default()));
         let child_stderr = child.stderr.take().expect("stderr was configured as piped");
+        let forward_confirmed = Arc::new(AtomicBool::new(false));
 
         let reader_stderr = Arc::clone(&stderr);
+        let reader_confirmed = Arc::clone(&forward_confirmed);
         let reader = std::thread::spawn(move || {
             // Raw bytes + from_utf8_lossy instead of BufRead::lines(): ssh's
             // stderr can contain non-UTF-8 bytes (a Latin-1 byte in a MOTD/banner,
@@ -321,6 +352,9 @@ impl Tunnel {
                     Ok(_) => {
                         let line = String::from_utf8_lossy(&buf);
                         let line = line.trim_end_matches(['\n', '\r']);
+                        if is_forward_listening(line, local_port) {
+                            reader_confirmed.store(true, Ordering::Release);
+                        }
                         reader_stderr.lock().unwrap().push_line(line);
                     }
                 }
@@ -332,11 +366,27 @@ impl Tunnel {
             local_port,
             stderr,
             reader: Some(reader),
+            forward_confirmed,
         })
     }
 
+    // T2 state machine (see docs/MVP1-PHASE2-DESIGN.md §2): a plain TCP probe
+    // success can't distinguish our own ssh's `-L` listener from a foreign
+    // process that happens to be listening on the same just-freed ephemeral
+    // port (see F3 in the design doc — reproduced, not hypothetical).
+    // `forward_confirmed()` is authoritative instead: it can only be set by
+    // parsing THIS tunnel's own child's own stderr for a line naming THIS
+    // local_port (see spawn_at / is_forward_listening), so once it is set
+    // there is no third party it could be confused with and no settle delay
+    // is needed. If it never sets (an OpenSSH build whose wording differs,
+    // or the reader thread lagging), this fails open rather than closed: a
+    // TCP-probe success is still accepted once `forward_confirm_grace` has
+    // elapsed since the first successful probe, but `forward_confirmed()`
+    // stays false and the caller surfaces that as a sticky warning instead
+    // of silently trusting it.
     pub fn wait_ready(&mut self, options: &TunnelOptions) -> Result<(), TunnelError> {
         let deadline = Instant::now() + options.ready_timeout;
+        let mut first_probe_success: Option<Instant> = None;
 
         loop {
             if let Some(status) = self
@@ -351,35 +401,31 @@ impl Tunnel {
                 });
             }
 
-            if let Ok(stream) =
-                TcpStream::connect_timeout(&self.local_addr(), options.probe_connect_timeout)
-            {
-                let _ = stream.shutdown(std::net::Shutdown::Both);
+            if self.forward_confirmed() {
+                return Ok(());
+            }
 
-                // This is best-effort, not a guarantee: it only catches a
-                // bind-race loser that exits within READY_SETTLE_DELAY of the
-                // probe succeeding. The pre-spawn liveness check in open_with
-                // closes the much more common case (a stale/stuck process
-                // already holding the port before we ever spawn); a fully
-                // authoritative fix would parse ssh's own "Local forwarding
-                // listening on ..." stderr line instead of inferring readiness
-                // from a third-party TCP connect. That line is only emitted by
-                // OpenSSH at `-v` (verbose) level, though, so this would also
-                // require adding `-v` to the argv and handling a much noisier
-                // stderr stream against STDERR_CAPTURE_LIMIT — a bigger change
-                // than "read a different line", and out of scope for MVP0.
-                std::thread::sleep(READY_SETTLE_DELAY);
-                return match self.child.try_wait() {
-                    Ok(None) => Ok(()),
-                    Ok(Some(status)) => {
-                        self.wait_for_stderr_drain(STDERR_DRAIN_BUDGET);
-                        Err(TunnelError::SshExited {
-                            status,
-                            stderr: self.stderr_tail(),
-                        })
-                    }
-                    Err(source) => Err(TunnelError::Wait { source }),
-                };
+            let probe_ok = match TcpStream::connect_timeout(
+                &self.local_addr(),
+                options.probe_connect_timeout,
+            ) {
+                Ok(stream) => {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    true
+                }
+                Err(_) => false,
+            };
+
+            if probe_ok {
+                let since = *first_probe_success.get_or_insert_with(Instant::now);
+                // Per F2, ssh writes the confirmation line immediately after
+                // its listen() succeeds, so in normal operation
+                // `forward_confirmed()` above is already true well before
+                // this branch is ever reached — this grace window only
+                // matters for the fail-open cases described above.
+                if since.elapsed() >= options.forward_confirm_grace {
+                    return Ok(());
+                }
             }
 
             if Instant::now() >= deadline {
@@ -406,6 +452,14 @@ impl Tunnel {
 
     pub fn local_addr(&self) -> SocketAddr {
         SocketAddr::from((LOCAL_BIND_ADDR, self.local_port))
+    }
+
+    /// `true` once this tunnel's own `ssh` child has confirmed (via its `-v`
+    /// stderr) that it — not some other process — owns the `-L` listener on
+    /// `local_port`. See `wait_ready`'s doc comment for what a `false` here
+    /// means once `open`/`open_with` has already returned `Ok`.
+    pub fn forward_confirmed(&self) -> bool {
+        self.forward_confirmed.load(Ordering::Acquire)
     }
 
     pub fn check_alive(&mut self) -> Result<(), TunnelError> {
@@ -494,6 +548,13 @@ fn is_port_occupied(local_port: u16, timeout: Duration) -> bool {
 fn is_forward_bind_failure(stderr: &str) -> bool {
     let lower = stderr.to_lowercase();
     lower.contains("address already in use") || lower.contains("cannot listen to port")
+}
+
+// Exact wording verified against OpenSSH_10.2p1:
+//   "debug1: Local forwarding listening on 127.0.0.1 port 65123."
+fn is_forward_listening(line: &str, local_port: u16) -> bool {
+    let lower = line.to_lowercase();
+    lower.contains("local forwarding listening on") && lower.contains(&format!("port {local_port}"))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -876,6 +937,7 @@ mod tests {
             probe_interval: Duration::from_millis(25),
             probe_connect_timeout: Duration::from_millis(300),
             port_attempts: 3,
+            forward_confirm_grace: Duration::from_millis(200),
         }
     }
 

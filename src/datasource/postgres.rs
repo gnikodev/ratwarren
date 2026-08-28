@@ -103,6 +103,11 @@ impl PostgresDataSource {
         let (host, port, tunnel): (String, u16, Option<Tunnel>) = match spec {
             Some(spec) => {
                 let tunnel_options = options.tunnel.clone();
+                // Held only around the spawn_blocking call, released before
+                // cfg.connect(...) below -- see OPEN_LOCK's doc comment for
+                // why this must serialize the whole open, not just the port
+                // reservation.
+                let _open_guard = crate::tunnel::OPEN_LOCK.lock().await;
                 let join =
                     tokio::task::spawn_blocking(move || Tunnel::open_with(&spec, &tunnel_options));
                 match join.await {
@@ -211,6 +216,16 @@ impl PostgresDataSource {
             t.lock()
                 .expect("tunnel mutex should not be poisoned")
                 .local_port()
+        })
+    }
+
+    /// `None` when there is no tunnel at all (nothing to confirm); `Some(false)`
+    /// is the T2 unconfirmed-tunnel case the UI shows a sticky warning for.
+    pub fn tunnel_forward_confirmed(&self) -> Option<bool> {
+        self.tunnel.as_ref().map(|t| {
+            t.lock()
+                .expect("tunnel mutex should not be poisoned")
+                .forward_confirmed()
         })
     }
 
