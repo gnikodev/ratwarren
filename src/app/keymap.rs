@@ -20,6 +20,14 @@ pub enum AppCommand {
     CloseTab,
     NextTab,
     PrevTab,
+    OpenPageList,
+    SavePage,
+    RenamePage,
+    NewPage,
+    ClosePage,
+    NextPage,
+    PrevPage,
+    ReloadPage,
 }
 
 pub enum RunKey {
@@ -51,6 +59,32 @@ pub fn map_key(key: KeyEvent, focus: Focus) -> Option<AppCommand> {
         (KeyCode::Char('w'), KeyModifiers::CONTROL) => return Some(AppCommand::CloseTab),
         (KeyCode::Char('n'), KeyModifiers::CONTROL) => return Some(AppCommand::NextTab),
         (KeyCode::Char('p'), KeyModifiers::CONTROL) => return Some(AppCommand::PrevTab),
+        // Page-tab management (saved SQL pages within a session), same
+        // global tier as the tab-management bindings above -- must never be
+        // shadowed by `Focus::Editor`'s bare-printable-character insert
+        // branch either. Ctrl+N/P/T/W are already taken by session tabs, so
+        // page tabs use Ctrl+G (new) / Alt+W (close) / Alt+N / Alt+P
+        // (next/prev), plus a Ctrl+PageUp/PageDown alias for next/prev since
+        // Alt reporting is inconsistent across terminals -- a dead key here
+        // is a harmless failure mode. `ClosePage` gets the same treatment:
+        // Ctrl+F4 (a common "close tab" convention) alongside Alt+W, since
+        // Alt+letter reporting is unreliable on at least macOS Terminal.app
+        // with default settings and Alt+W must not be the only path to
+        // close a page.
+        (KeyCode::Char('o'), KeyModifiers::CONTROL) => return Some(AppCommand::OpenPageList),
+        (KeyCode::Char('s'), KeyModifiers::CONTROL) => return Some(AppCommand::SavePage),
+        (KeyCode::F(2), _) => return Some(AppCommand::RenamePage),
+        (KeyCode::F(5), _) => return Some(AppCommand::ReloadPage),
+        (KeyCode::Char('g'), KeyModifiers::CONTROL) => return Some(AppCommand::NewPage),
+        (KeyCode::Char('w'), KeyModifiers::ALT) | (KeyCode::F(4), KeyModifiers::CONTROL) => {
+            return Some(AppCommand::ClosePage);
+        }
+        (KeyCode::Char('n'), KeyModifiers::ALT) | (KeyCode::PageDown, KeyModifiers::CONTROL) => {
+            return Some(AppCommand::NextPage);
+        }
+        (KeyCode::Char('p'), KeyModifiers::ALT) | (KeyCode::PageUp, KeyModifiers::CONTROL) => {
+            return Some(AppCommand::PrevPage);
+        }
         _ => {}
     }
 
@@ -359,5 +393,113 @@ mod tests {
             map_key(key(KeyCode::Esc), Focus::Editor),
             Some(AppCommand::Editor(EditorCommand::ClearSelection))
         ));
+    }
+
+    // --- Phase 3: page-tab bindings must fire regardless of Focus ---
+
+    fn alt_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::ALT)
+    }
+
+    #[test]
+    fn page_tab_keys_map_regardless_of_focus() {
+        for focus in [Focus::Tree, Focus::Grid, Focus::Editor] {
+            assert!(
+                matches!(
+                    map_key(ctrl_key(KeyCode::Char('o')), focus),
+                    Some(AppCommand::OpenPageList)
+                ),
+                "Ctrl+O must open the page list in {focus:?}"
+            );
+            assert!(
+                matches!(
+                    map_key(ctrl_key(KeyCode::Char('s')), focus),
+                    Some(AppCommand::SavePage)
+                ),
+                "Ctrl+S must save the page in {focus:?}"
+            );
+            assert!(
+                matches!(
+                    map_key(key(KeyCode::F(2)), focus),
+                    Some(AppCommand::RenamePage)
+                ),
+                "F2 must rename the page in {focus:?}"
+            );
+            assert!(
+                matches!(
+                    map_key(ctrl_key(KeyCode::Char('g')), focus),
+                    Some(AppCommand::NewPage)
+                ),
+                "Ctrl+G must open a new page in {focus:?}"
+            );
+            assert!(
+                matches!(
+                    map_key(alt_key(KeyCode::Char('w')), focus),
+                    Some(AppCommand::ClosePage)
+                ),
+                "Alt+W must close the page in {focus:?}"
+            );
+            assert!(
+                matches!(
+                    map_key(KeyEvent::new(KeyCode::F(4), KeyModifiers::CONTROL), focus),
+                    Some(AppCommand::ClosePage)
+                ),
+                "Ctrl+F4 must close the page in {focus:?} (Alt+W's non-Alt fallback)"
+            );
+            assert!(
+                matches!(
+                    map_key(alt_key(KeyCode::Char('n')), focus),
+                    Some(AppCommand::NextPage)
+                ),
+                "Alt+N must switch to the next page in {focus:?}"
+            );
+            assert!(
+                matches!(
+                    map_key(
+                        KeyEvent::new(KeyCode::PageDown, KeyModifiers::CONTROL),
+                        focus
+                    ),
+                    Some(AppCommand::NextPage)
+                ),
+                "Ctrl+PageDown must switch to the next page in {focus:?}"
+            );
+            assert!(
+                matches!(
+                    map_key(alt_key(KeyCode::Char('p')), focus),
+                    Some(AppCommand::PrevPage)
+                ),
+                "Alt+P must switch to the previous page in {focus:?}"
+            );
+            assert!(
+                matches!(
+                    map_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::CONTROL), focus),
+                    Some(AppCommand::PrevPage)
+                ),
+                "Ctrl+PageUp must switch to the previous page in {focus:?}"
+            );
+            assert!(
+                matches!(
+                    map_key(key(KeyCode::F(5)), focus),
+                    Some(AppCommand::ReloadPage)
+                ),
+                "F5 must reload the page in {focus:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn page_tab_letters_without_modifiers_still_insert_in_editor_focus() {
+        // The direct contrast for the page-tab bindings that reuse ordinary
+        // letters under Ctrl/Alt: the bare letters themselves must still
+        // behave as ordinary editor input in `Focus::Editor`.
+        for c in ['o', 's', 'g', 'w', 'n', 'p'] {
+            assert!(
+                matches!(
+                    map_key(key(KeyCode::Char(c)), Focus::Editor),
+                    Some(AppCommand::Editor(EditorCommand::Insert(got))) if got == c
+                ),
+                "bare {c:?} in Focus::Editor must insert, not be captured by page-tab management"
+            );
+        }
     }
 }

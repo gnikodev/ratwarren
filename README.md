@@ -7,10 +7,11 @@ public internet.
 Written in Rust with [ratatui](https://ratatui.rs). Inspired by the
 `lazy*` family of tools (lazygit, lazydocker), but for SQL.
 
-> **Status: MVP0 implemented, not yet dogfooded.** All MVP0 phases in
-> [docs/MVP0-PLAN.md](docs/MVP0-PLAN.md) are built and tested; a real
-> session against a personal VPS is the last outstanding step. See
-> [docs/ROADMAP.md](docs/ROADMAP.md) for what comes after MVP0.
+> **Status: MVP0 done, MVP1 in progress (phases 1-2 done).** Connection
+> grouping and multiple simultaneous connections/tabs are implemented; a
+> real multi-tab session against personal VPS boxes is the next outstanding
+> step. See [docs/ROADMAP.md](docs/ROADMAP.md) and
+> [docs/MVP1-PLAN.md](docs/MVP1-PLAN.md) for what's done and what's next.
 
 ## Why
 
@@ -71,8 +72,14 @@ keybinding, and current limitations — see
    ratwarren prod          # explicit connection name
    ratwarren                # works too if you only have one connection configured
    ```
-   With more than one connection and no name given, ratwarren lists the
-   configured names and exits instead of guessing which one you meant.
+   With zero or several connections configured and no name given, ratwarren
+   opens straight into a connection picker instead of guessing — open more
+   connections as additional tabs from there with `Ctrl+T`. Add an optional
+   `group = "..."` field to a connection to organize the picker when you
+   have several boxes configured; see
+   [docs/USER-GUIDE.md](docs/USER-GUIDE.md#multiple-connections-and-tabs)
+   for the full multi-connection and tunnel setup, including what a tab
+   looks like while it's still connecting or if it fails.
 
 ## Configuration and secrets
 
