@@ -1,13 +1,10 @@
 use std::process::ExitCode;
-use std::sync::Arc;
 
 use ratwarren::app::{self, App};
 use ratwarren::cli::{self, Invocation};
 use ratwarren::config::Config;
-use ratwarren::datasource::{DataSource, PostgresDataSource};
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     match cli::parse_args(std::env::args()) {
         Invocation::Help => {
             println!("{}", cli::USAGE);
@@ -19,7 +16,46 @@ async fn main() -> ExitCode {
             ExitCode::from(2)
         }
         Invocation::SetPassword { name } => set_password(&name),
-        Invocation::Run { name } => run(name).await,
+        Invocation::Run { name } => {
+            // Deliberately not `#[tokio::main]`: since Phase 2, connecting a
+            // session (`PostgresDataSource::connect_with`) runs
+            // `Tunnel::open_with` on `spawn_blocking` *from inside the running
+            // event loop*, not before it. `#[tokio::main]`'s expansion drops
+            // the `Runtime` at the end of `main`, and `Runtime`'s `Drop` waits
+            // for the blocking pool to drain -- it cannot cancel an in-flight
+            // `spawn_blocking` closure. So quitting while a tunnel open is
+            // still stuck (e.g. an unreachable host) would hang the process
+            // for up to `ready_timeout` with the terminal already restored,
+            // and `Ctrl+C` can't help once raw mode has turned it into a
+            // swallowed key event. Building the runtime by hand and calling
+            // `shutdown_background()` instead of letting it drop returns
+            // immediately without waiting for that blocking task -- verified
+            // with a stub `ssh` that never binds: quitting mid-connect exits
+            // the process in well under a second instead of hanging for
+            // `ready_timeout`.
+            //
+            // `shutdown_background()` returning immediately means it does NOT
+            // wait for that blocking task either -- it abandons it, so a
+            // `Tunnel` value still live on that task's stack never reaches
+            // `Drop`/`terminate()` (the only thing that kills the `ssh`
+            // child) through the ownership chain alone. `kill_all_registered()`
+            // below is the unconditional safety net for exactly that case --
+            // see `tunnel::LIVE_CHILDREN`'s doc comment.
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(e) => {
+                    eprintln!("failed to start the async runtime: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let code = runtime.block_on(run(name));
+            runtime.shutdown_background();
+            ratwarren::tunnel::kill_all_registered();
+            code
+        }
     }
 }
 
@@ -32,75 +68,26 @@ async fn run(name: Option<String>) -> ExitCode {
         }
     };
 
-    let name = match pick_connection(&config, name) {
+    // A resolvable starting connection name is optional here (unlike MVP0):
+    // with none, `App` starts with zero sessions and the picker auto-opens.
+    // Every session -- including this first one -- opens through the same
+    // `spawn_open` path, so there is no special pre-`ratatui::init()`
+    // secret-resolution step anymore.
+    let name = match resolve_starting_connection(&config, name) {
         Ok(name) => name,
         Err(code) => return code,
     };
-    let conn = config
-        .connection(&name)
-        .expect("pick_connection only returns names present in config");
 
-    // Must happen before ratatui::init(): a blocking keyring call and any
-    // stderr note it prints need the primary screen -- doing this inside the
-    // tokio event loop (after the terminal is in alternate-screen/raw mode)
-    // would freeze the UI instead of showing the user anything.
-    let secret = ratwarren::secret::resolve(conn);
-    if let Some(note) = secret.note() {
-        eprintln!("note: {note}");
+    let mut app = App::new(config);
+    if let Some(name) = &name {
+        app.open_connection(name);
     }
-    eprintln!("connecting to {name}…");
-    let source = PostgresDataSource::connect(conn, secret.password()).await;
-    drop(secret);
-    let source = match source {
-        Ok(source) => source,
-        Err(e) => {
-            eprintln!("{}", ratwarren::ui::error_chain(&e));
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let pg = Arc::new(source);
-    let worker_source: Arc<dyn DataSource> = pg.clone();
-    let canceller_source: Arc<dyn DataSource> = pg.clone();
-
-    let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (cancel_tx, cancel_rx) = tokio::sync::mpsc::unbounded_channel();
-    let worker_handle = app::worker::spawn(worker_source, request_rx, response_tx.clone());
-    let canceller_handle = app::worker::spawn_canceller(canceller_source, cancel_rx, response_tx);
 
     let mut terminal = ratatui::init();
-    let mut app = App::new(name, request_tx, response_rx, cancel_tx);
     let result = app::run(&mut terminal, &mut app).await;
     ratatui::restore();
 
-    // `app` owns the last clone of `request_tx`/`cancel_tx` outside the
-    // worker/canceller tasks themselves; drop it explicitly so their
-    // `recv().await` loops observe the channel close.
-    drop(app);
-
-    // The worker only notices the channel closing *after* its current
-    // `handle(...).await` call returns, and nothing times out a request
-    // against an unresponsive connection — so a plain `.await` here can hang
-    // forever with the terminal already restored. Abort it instead: for a
-    // quit path in a single-user tool, not waiting for an in-flight
-    // DataSource call to finish is the right tradeoff, since nothing
-    // consumes its response after quit anyway. `worker_handle.await`
-    // resolves promptly once the task notices the abort at its next await
-    // point, which drops its `Arc<dyn DataSource>` clone — a precondition
-    // for `Arc::into_inner` below to succeed. The canceller task holds its
-    // own separate `Arc<dyn DataSource>` clone and must be aborted/awaited
-    // the same way before that precondition holds.
-    worker_handle.abort();
-    let _ = worker_handle.await;
-    canceller_handle.abort();
-    let _ = canceller_handle.await;
-
-    // `None` only if something above still holds a clone; the tunnel's own
-    // Drop impl reaps the ssh child regardless, so that case is safe to skip.
-    if let Some(pg) = Arc::into_inner(pg) {
-        pg.close().await;
-    }
+    app.shutdown().await;
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -155,19 +142,27 @@ fn set_password(name: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn pick_connection(config: &Config, name: Option<String>) -> Result<String, ExitCode> {
+/// `Ok(None)` means "no starting connection resolved" -- `App` then starts
+/// with zero sessions and the picker auto-opens, rather than this being an
+/// error. An explicit but unknown `name`, unlike the no-name case, is still
+/// a hard error (unchanged from MVP0's `pick_connection`): the user asked
+/// for a specific connection that doesn't exist, which is a typo to report,
+/// not a reason to silently fall back to the picker.
+fn resolve_starting_connection(
+    config: &Config,
+    name: Option<String>,
+) -> Result<Option<String>, ExitCode> {
     if let Some(name) = name {
         if config.connection(&name).is_some() {
-            return Ok(name);
+            return Ok(Some(name));
         }
         print_available(config);
         return Err(ExitCode::from(2));
     }
     if config.connections.len() == 1 {
-        return Ok(config.connections[0].name.clone());
+        return Ok(Some(config.connections[0].name.clone()));
     }
-    print_available(config);
-    Err(ExitCode::from(2))
+    Ok(None)
 }
 
 fn print_available(config: &Config) {

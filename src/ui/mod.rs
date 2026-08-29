@@ -1,5 +1,6 @@
 pub mod editor;
 pub mod grid;
+pub mod picker;
 pub mod tree;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

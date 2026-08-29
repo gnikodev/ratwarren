@@ -57,7 +57,10 @@ impl Resolved {
 /// async, no matter which caller is asking.
 enum PreLookup {
     Resolved(Resolved),
-    NeedsLookup { service: &'static str, account: String },
+    NeedsLookup {
+        service: &'static str,
+        account: String,
+    },
 }
 
 fn pre_lookup(conn: &crate::config::Connection, env_password: Option<String>) -> PreLookup {
@@ -109,6 +112,19 @@ where
 pub async fn resolve_async(conn: &crate::config::Connection, notes: &NoteSink) -> Resolved {
     let env_password = std::env::var(PASSWORD_ENV_VAR).ok();
     resolve_with_async(conn, env_password, keyring_lookup_blocking, notes).await
+}
+
+/// `true` iff `resolve_async` will actually perform a blocking OS-keyring
+/// lookup for this connection under the current environment -- lets
+/// `spawn_open` skip its "reading the OS keyring…" progress message when
+/// nothing is about to touch the keyring at all (no password configured, or
+/// `RATWARREN_PASSWORD` already satisfies it).
+pub(crate) fn will_look_up_keyring(conn: &crate::config::Connection) -> bool {
+    let env_password = std::env::var(PASSWORD_ENV_VAR).ok();
+    matches!(
+        pre_lookup(conn, env_password),
+        PreLookup::NeedsLookup { .. }
+    )
 }
 
 pub(crate) async fn resolve_with_async<F>(
@@ -365,6 +381,154 @@ mod tests {
         assert!(
             !debug.contains("supersecret"),
             "Resolved's hand-written Debug impl must never leak the password, got {debug:?}"
+        );
+    }
+
+    // --- resolve_with_async: same decision matrix as resolve_with, plus the
+    // async-specific properties S1/S2 exist for. ---
+
+    fn no_notes() -> impl Fn(String) {
+        |message: String| panic!("no note was expected, got: {message:?}")
+    }
+
+    #[tokio::test]
+    async fn async_env_var_takes_precedence_over_keyring() {
+        let conn = connection_with_keyring_password();
+        let resolved = resolve_with_async(
+            &conn,
+            Some("from-env".to_string()),
+            |_, _| panic!("keyring lookup must not be attempted when the env var is set"),
+            &no_notes(),
+        )
+        .await;
+        assert_eq!(resolved.password(), Some("from-env"));
+    }
+
+    #[tokio::test]
+    async fn async_empty_env_var_falls_through_to_keyring() {
+        let conn = connection_with_keyring_password();
+        let resolved = resolve_with_async(
+            &conn,
+            Some(String::new()),
+            |_, _| Ok("from-keyring".to_string()),
+            &no_notes(),
+        )
+        .await;
+        assert_eq!(resolved.password(), Some("from-keyring"));
+    }
+
+    #[tokio::test]
+    async fn async_no_password_configured_and_no_env_var_is_not_configured() {
+        let conn = connection_without_password();
+        let resolved = resolve_with_async(
+            &conn,
+            None,
+            |_, _| panic!("keyring lookup must not be attempted without a configured password"),
+            &no_notes(),
+        )
+        .await;
+        assert!(matches!(resolved, Resolved::NotConfigured));
+        assert_eq!(resolved.password(), None);
+    }
+
+    #[tokio::test]
+    async fn async_keyring_lookup_success_is_used_with_the_right_service_and_account() {
+        let conn = connection_with_keyring_password();
+        let expected_service = conn.keyring_service();
+        let expected_account = conn.keyring_account().expect("test setup: account is Some");
+        let resolved = resolve_with_async(
+            &conn,
+            None,
+            move |service, account| {
+                assert_eq!(service, expected_service);
+                assert_eq!(account, expected_account);
+                Ok("secret".to_string())
+            },
+            &no_notes(),
+        )
+        .await;
+        assert_eq!(resolved.password(), Some("secret"));
+    }
+
+    #[tokio::test]
+    async fn async_keyring_lookup_failure_is_unavailable_with_a_note() {
+        let conn = connection_with_keyring_password();
+        let resolved =
+            resolve_with_async(&conn, None, |_, _| Err("no entry".to_string()), &no_notes()).await;
+        assert!(matches!(resolved, Resolved::Unavailable { .. }));
+        let note = resolved.note().expect("Unavailable must carry a note");
+        assert!(note.contains("no entry"), "got {note:?}");
+    }
+
+    // S1: dropping the returned future (e.g. the app quitting, or -- in the
+    // real multi-session caller -- the tab being closed) while the detached
+    // lookup thread is still stuck must not hang the caller. A bounded outer
+    // timeout races a lookup that blocks forever; if resolve_with_async's
+    // future itself blocked (e.g. if S1 had wrapped the lookup in
+    // spawn_blocking, which waits for the blocking pool on drop/shutdown),
+    // this would hang instead of returning promptly.
+    #[tokio::test]
+    async fn async_dropping_the_future_while_the_lookup_is_stuck_does_not_hang() {
+        let conn = connection_with_keyring_password();
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(100),
+            resolve_with_async(
+                &conn,
+                None,
+                |_, _| {
+                    // Never returns -- simulates a hung OS keyring prompt.
+                    std::thread::park();
+                    unreachable!("parked forever");
+                },
+                &no_notes(),
+            ),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the outer 100ms timeout should have elapsed well before the 3s/60s internal \
+             timeouts, proving the future can be dropped promptly rather than hanging"
+        );
+    }
+
+    // The 3s/60s constants make a real-time test of the notice path slow;
+    // `start_paused` plus a lookup that never sends makes the wait purely
+    // timer-bound (nothing else could possibly wake the task), so tokio's
+    // paused-clock auto-advance can resolve both timeouts deterministically
+    // without an actual multi-second wall-clock wait.
+    #[tokio::test(start_paused = true)]
+    async fn async_slow_lookup_emits_the_notice_as_a_callback_not_stderr_then_times_out() {
+        let conn = connection_with_keyring_password();
+        let notes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let notes_captured = std::sync::Arc::clone(&notes);
+        let note_sink = move |message: String| notes_captured.lock().unwrap().push(message);
+
+        let resolved = resolve_with_async(
+            &conn,
+            None,
+            |_, _| {
+                // Never returns: the oneshot sender is dropped only once this
+                // closure returns, and it never does, so the recv() side is
+                // purely timer-bound for the whole test.
+                std::thread::park();
+                unreachable!("parked forever");
+            },
+            &note_sink,
+        )
+        .await;
+
+        let notes = notes.lock().unwrap();
+        assert_eq!(
+            notes.len(),
+            1,
+            "the slow-path notice must be routed through the NoteSink callback exactly once, \
+             got {notes:?}"
+        );
+        assert!(notes[0].contains("still waiting for the OS keyring"));
+        assert!(
+            matches!(resolved, Resolved::Unavailable { ref reason } if reason.contains("timed out")),
+            "past KEYRING_GIVE_UP_AFTER with no response, resolve_with_async must give up, got \
+             {resolved:?}"
         );
     }
 }

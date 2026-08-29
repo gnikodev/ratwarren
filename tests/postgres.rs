@@ -29,11 +29,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use ratwarren::app::message::{WorkerRequest, WorkerResponse};
+use ratwarren::app::message::{SessionResponse, WorkerRequest, WorkerResponse};
 use ratwarren::app::run::{
     CancelOutcome, CancelRequest, QueryOutcome, QueryRequest, QueryResponse, RunOutcome, RunState,
     RunSummary,
 };
+use ratwarren::app::session::{Session, SessionId, SourceHandle};
 use ratwarren::app::worker;
 use ratwarren::config::Connection;
 use ratwarren::datasource::{
@@ -1000,22 +1001,32 @@ async fn fetch_page_error_does_not_leave_the_connection_busy_for_the_next_reques
 // unbounded editor SQL, and retry_on_busy recovering from the abandoned-
 // stream drain that this branch hands off to.
 
+// Single fixed id: every worker/canceller pair in this file belongs to
+// exactly one logical session, so the `SessionId` tag on every
+// `SessionResponse` is uninteresting here and just unwrapped away by the
+// helpers below -- these tests predate `SessionId`-based routing (added for
+// multi-session support) and are only asserting single-connection worker
+// behavior.
+fn test_session_id() -> SessionId {
+    SessionId(0)
+}
+
 fn spawn_worker(
     source: Arc<dyn DataSource>,
 ) -> (
     tokio::sync::mpsc::UnboundedSender<WorkerRequest>,
-    tokio::sync::mpsc::UnboundedReceiver<WorkerResponse>,
+    tokio::sync::mpsc::UnboundedReceiver<SessionResponse>,
     tokio::task::JoinHandle<()>,
 ) {
     let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
     let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel();
-    let handle = worker::spawn(source, request_rx, response_tx);
+    let handle = worker::spawn(test_session_id(), source, request_rx, response_tx);
     (request_tx, response_rx, handle)
 }
 
 async fn run_query(
     request_tx: &tokio::sync::mpsc::UnboundedSender<WorkerRequest>,
-    response_rx: &mut tokio::sync::mpsc::UnboundedReceiver<WorkerResponse>,
+    response_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionResponse>,
     id: RequestId,
     sql: &str,
     timeout: Duration,
@@ -1033,7 +1044,8 @@ async fn run_query(
             .unwrap_or_else(|_| {
                 panic!("worker did not respond to query {id:?} ({sql:?}) within {timeout:?}")
             })
-            .expect("worker response channel should not close mid-test");
+            .expect("worker response channel should not close mid-test")
+            .response;
         if let WorkerResponse::Query(QueryResponse::Finished { id: got_id, result }) = response
             && got_id == id
         {
@@ -1231,7 +1243,7 @@ async fn query_worker_reports_no_result_set_for_a_zero_row_update() {
 // reimplementation of any of those three.
 
 type RequestSender = tokio::sync::mpsc::UnboundedSender<WorkerRequest>;
-type ResponseReceiver = tokio::sync::mpsc::UnboundedReceiver<WorkerResponse>;
+type ResponseReceiver = tokio::sync::mpsc::UnboundedReceiver<SessionResponse>;
 type CancelSender = tokio::sync::mpsc::UnboundedSender<CancelRequest>;
 
 struct FullWorker {
@@ -1246,8 +1258,14 @@ fn spawn_full_worker(source: Arc<dyn DataSource>) -> FullWorker {
     let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
     let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel();
     let (cancel_tx, cancel_rx) = tokio::sync::mpsc::unbounded_channel();
-    let worker_handle = worker::spawn(Arc::clone(&source), request_rx, response_tx.clone());
-    let canceller_handle = worker::spawn_canceller(source, cancel_rx, response_tx);
+    let worker_handle = worker::spawn(
+        test_session_id(),
+        Arc::clone(&source),
+        request_rx,
+        response_tx.clone(),
+    );
+    let canceller_handle =
+        worker::spawn_canceller(test_session_id(), source, cancel_rx, response_tx);
     FullWorker {
         request_tx,
         response_rx,
@@ -1280,7 +1298,7 @@ async fn shutdown_full_worker(
 /// mirroring `RunState::start`).
 async fn drive_run(
     request_tx: &tokio::sync::mpsc::UnboundedSender<WorkerRequest>,
-    response_rx: &mut tokio::sync::mpsc::UnboundedReceiver<WorkerResponse>,
+    response_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionResponse>,
     cancel_tx: &tokio::sync::mpsc::UnboundedSender<CancelRequest>,
     plan: Vec<RunUnit>,
     per_response_timeout: Duration,
@@ -1301,7 +1319,8 @@ async fn drive_run(
             let response = tokio::time::timeout(per_response_timeout, response_rx.recv())
                 .await
                 .expect("worker should respond within the timeout")
-                .expect("worker response channel should not close mid-test");
+                .expect("worker response channel should not close mid-test")
+                .response;
             let WorkerResponse::Query(q) = response else {
                 continue;
             };
@@ -1336,7 +1355,7 @@ async fn drive_run(
 }
 
 async fn assert_no_further_response_arrives(
-    response_rx: &mut tokio::sync::mpsc::UnboundedReceiver<WorkerResponse>,
+    response_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionResponse>,
 ) {
     // Bounded wait rather than an instantaneous `try_recv`: the worker task
     // needs at least one scheduler tick (and, in these tests, sometimes an
@@ -1596,7 +1615,13 @@ async fn full_run_path_cancel_mid_run_stops_the_run_and_never_issues_the_next_st
         canceller_handle,
     } = spawn_full_worker(Arc::clone(&source));
 
-    let text = "SELECT pg_sleep(10); SELECT 1;";
+    // `pg_sleep(60)`, not `pg_sleep(10)`: the assertion below waits up to 10s
+    // for the cancel to land. Identical deadlines here would mean any
+    // scheduling jitter under concurrent test load could tip a healthy pass
+    // into a false failure (observed once in a 32-test concurrent run) --
+    // lengthening the statement well past the assertion timeout, rather than
+    // shortening the timeout, keeps a genuine hang failing just as fast.
+    let text = "SELECT pg_sleep(60); SELECT 1;";
     let buf = TextBuffer::from_text(text);
     let units = plan_run(&buf, RunTarget::Buffer).expect("no tokenizer error");
     assert_eq!(units.len(), 2);
@@ -1614,7 +1639,8 @@ async fn full_run_path_cancel_mid_run_stops_the_run_and_never_issues_the_next_st
     let started = tokio::time::timeout(Duration::from_secs(5), response_rx.recv())
         .await
         .expect("worker should report Started promptly")
-        .expect("channel open");
+        .expect("channel open")
+        .response;
     let WorkerResponse::Query(QueryResponse::Started { id, query_id }) = started else {
         panic!("expected the first response to be Started");
     };
@@ -1629,8 +1655,9 @@ async fn full_run_path_cancel_mid_run_stops_the_run_and_never_issues_the_next_st
 
     let finished = tokio::time::timeout(Duration::from_secs(10), response_rx.recv())
         .await
-        .expect("worker should report Finished (cancelled) well before pg_sleep(10) elapses")
-        .expect("channel open");
+        .expect("worker should report Finished (cancelled) well before pg_sleep(60) elapses")
+        .expect("channel open")
+        .response;
     let WorkerResponse::Query(QueryResponse::Finished {
         id: finished_id,
         result,
@@ -1671,7 +1698,8 @@ async fn full_run_path_cancel_mid_run_stops_the_run_and_never_issues_the_next_st
     let response = tokio::time::timeout(Duration::from_secs(10), response_rx.recv())
         .await
         .expect("worker should recover and answer list_tables")
-        .expect("channel open");
+        .expect("channel open")
+        .response;
     match response {
         WorkerResponse::Tree(TreeResponse::Tables { result, .. }) => {
             assert!(
@@ -1773,7 +1801,8 @@ async fn full_run_path_abandon_and_retry_is_reliable_across_repeated_back_to_bac
                         .unwrap_or_else(|_| {
                             panic!("iteration {i}: worker did not respond within 15s")
                         })
-                        .unwrap_or_else(|| panic!("iteration {i}: response channel closed"));
+                        .unwrap_or_else(|| panic!("iteration {i}: response channel closed"))
+                        .response;
                     let WorkerResponse::Query(q) = response else {
                         continue;
                     };
@@ -1894,4 +1923,167 @@ async fn full_run_path_abandon_and_retry_is_reliable_across_repeated_back_to_bac
     );
 
     shutdown_full_worker(request_tx, cancel_tx, worker_handle, canceller_handle).await;
+}
+
+// --- Multi-session routing via the REAL SourceHandle::attach wiring
+// (Phase 2's explicit test criterion; docs/MVP1-PHASE2-DESIGN.md §9 item 11).
+//
+// Every other worker/canceller pair in this file is spawned directly via
+// `worker::spawn`/`worker::spawn_canceller` against a single fixed
+// `test_session_id()` -- that exercises the worker's own request/response
+// handling, but never `SourceHandle::attach` itself, which is what actually
+// wires a *distinct* `SessionId` into a worker/canceller pair for each
+// session in the real app. `SessionState::TestReady` (the lib crate's
+// `#[cfg(test)]`-only stand-in for `Ready` that skips `attach` entirely) is
+// also invisible from here, since this is a separate integration-test crate
+// compiled without the lib crate's `cfg(test)` -- so this is the only place
+// in the whole test suite that can exercise `attach` against a real,
+// connected `PostgresDataSource`.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_sessions_via_source_handle_attach_route_each_sessions_response_to_the_correct_session()
+{
+    require_pg!();
+
+    let (responses_tx, mut responses_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let session_a = SessionId(101);
+    let session_b = SessionId(202);
+    let handle_a = SourceHandle::attach(connect().await, session_a, responses_tx.clone());
+    let handle_b = SourceHandle::attach(connect().await, session_b, responses_tx.clone());
+    drop(responses_tx);
+
+    // Deliberately the SAME RequestId for both sessions: in the real app each
+    // session's RunState counter independently starts at 0 (see the
+    // routing-invariant unit test in src/app/mod.rs), so RequestId(1) in
+    // session A and RequestId(1) in session B are unrelated values that a
+    // correct implementation must still keep apart. Using the same id here
+    // means a routing bug that ignored SessionId and matched on RequestId
+    // alone would silently "work" by accident on mismatched data instead of
+    // panicking outright -- the row-content assertions below are what catch
+    // that.
+    let id = RequestId(1);
+    let sql_a = "SELECT 'session-a-marker'";
+    let sql_b = "SELECT 'session-b-marker'";
+
+    // Both requests are sent before either response is consumed, so the two
+    // sessions' independent worker tasks genuinely interleave their handling
+    // rather than running strictly sequentially.
+    handle_a.send(WorkerRequest::Query(QueryRequest {
+        id,
+        sql: sql_a.to_string(),
+    }));
+    handle_b.send(WorkerRequest::Query(QueryRequest {
+        id,
+        sql: sql_b.to_string(),
+    }));
+
+    let mut a_responses = Vec::new();
+    let mut b_responses = Vec::new();
+    // 2 responses per session: Started, then Finished.
+    for _ in 0..4 {
+        let msg = tokio::time::timeout(Duration::from_secs(5), responses_rx.recv())
+            .await
+            .expect("both sessions should respond within the timeout")
+            .expect("response channel should not close mid-test");
+        if msg.session == session_a {
+            a_responses.push(msg.response);
+        } else if msg.session == session_b {
+            b_responses.push(msg.response);
+        } else {
+            panic!(
+                "a SessionResponse was tagged with neither session's id: {:?}",
+                msg.session
+            );
+        }
+    }
+
+    fn extract_marker(responses: Vec<WorkerResponse>, request_id: RequestId) -> String {
+        assert_eq!(
+            responses.len(),
+            2,
+            "each session should see exactly Started then Finished, saw {} responses",
+            responses.len()
+        );
+        for response in responses {
+            let WorkerResponse::Query(q) = response else {
+                panic!("expected only Query responses from a Query-only request stream");
+            };
+            match q {
+                QueryResponse::Started { id, .. } => assert_eq!(id, request_id),
+                QueryResponse::Finished { id, result } => {
+                    assert_eq!(id, request_id);
+                    match result.expect("SELECT of a string literal should not fail") {
+                        QueryOutcome::Rows(page) => {
+                            return page.rows[0][0]
+                                .clone()
+                                .expect("the marker column is never NULL");
+                        }
+                        QueryOutcome::NoResultSet { .. } => {
+                            panic!("a SELECT must report Rows, not NoResultSet")
+                        }
+                    }
+                }
+                QueryResponse::CancelFailed { message, .. } => {
+                    panic!("unexpected CancelFailed: {message}")
+                }
+            }
+        }
+        unreachable!("Finished branch above always returns before the loop ends")
+    }
+
+    assert_eq!(
+        extract_marker(a_responses, id),
+        "session-a-marker",
+        "session A's responses must carry session A's own query result, not session B's"
+    );
+    assert_eq!(
+        extract_marker(b_responses, id),
+        "session-b-marker",
+        "session B's responses must carry session B's own query result, not session A's"
+    );
+
+    handle_a.shutdown().await;
+    handle_b.shutdown().await;
+}
+
+// --- Session::tunnel_warning() -- the "no tunnel at all" case (docs/MVP1-PHASE2-DESIGN.md
+// §2 T2 item 5). The `Some(true)`/`Some(false)` cases live in
+// tests/tunnel_process.rs (they need a real ssh tunnel in addition to a real
+// Postgres); this file's `test_connection()` has no tunnel at all -- exactly
+// the "e.g. a local connection" case `tunnel_warning()`'s doc comment calls
+// out, where there is nothing to confirm and the warning must never fire.
+
+#[tokio::test]
+async fn tunnel_warning_is_none_for_a_ready_session_with_no_tunnel_at_all() {
+    require_pg!();
+
+    let (responses_tx, _responses_rx) = tokio::sync::mpsc::unbounded_channel();
+    let session_id = SessionId(1);
+    let handle = SourceHandle::attach(connect().await, session_id, responses_tx);
+    assert_eq!(
+        handle.tunnel_local_port(),
+        None,
+        "test setup: test_connection() has no tunnel configured"
+    );
+    assert_eq!(
+        handle.tunnel_forward_confirmed(),
+        None,
+        "test setup: with no tunnel there is nothing to confirm"
+    );
+
+    // `handle` is moved into `session` here and, unlike `handle_a`/`handle_b`
+    // above, is never explicitly `shutdown()`ed: `Session::into_state()` (the
+    // only way to get a `SourceHandle` back out of a `Session`) is
+    // `pub(crate)` and invisible from this separate integration-test crate.
+    // Dropping `session` at the end of this test still tears down the
+    // connection/tasks, just without the graceful drain `shutdown()` gives.
+    let mut session = Session::new(session_id, "no-tunnel".to_string(), None);
+    session.on_connected(handle);
+
+    assert_eq!(
+        session.tunnel_warning(),
+        None,
+        "a Ready session with no tunnel at all must never show the T2 tunnel warning"
+    );
 }

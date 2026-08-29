@@ -1,6 +1,7 @@
 mod command;
 mod port;
 
+use std::collections::HashSet;
 use std::io::BufRead;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::path::PathBuf;
@@ -30,6 +31,61 @@ pub const LOCAL_BIND_ADDR: Ipv4Addr = Ipv4Addr::LOCALHOST;
 // held across an `.await` that can last seconds (up to `ready_timeout` per
 // queued tunnel).
 pub static OPEN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+// Safety net for `ssh` children whose owning `Tunnel` never gets to run
+// `Drop`/`terminate()` -- specifically, a `spawn_blocking(|| Tunnel::open_with(..))`
+// or `spawn_blocking(|| tunnel.shutdown())` task that main.rs abandons (via
+// `Runtime::shutdown_background()`/a bounded `shutdown_timeout`) on process
+// exit instead of letting it finish. `Drop` cannot be relied on for a task
+// that never returns, so this tracks live child pids independently of the
+// `Tunnel`/`SourceHandle` ownership chain: `spawn_at` registers a pid right
+// after a successful spawn, `terminate()` deregisters it on both the normal
+// and explicit-shutdown paths (so a cleanly-closed tunnel never lingers
+// here), and `kill_all_registered()` is main's unconditional last resort for
+// whatever is still left in the set.
+static LIVE_CHILDREN: std::sync::LazyLock<Mutex<HashSet<u32>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn register_child(pid: u32) {
+    LIVE_CHILDREN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(pid);
+}
+
+fn deregister_child(pid: u32) {
+    LIVE_CHILDREN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&pid);
+}
+
+/// Synchronously kills every `ssh` child pid still in the registry. Meant to
+/// be called once, unconditionally, right after the async runtime is torn
+/// down on process exit -- see main.rs. Shells out to the system `kill`
+/// (consistent with this project's existing "shell out to system tools"
+/// approach for `ssh` itself) rather than depending on an owned `Child`
+/// handle, since the whole point is to reach a process whose `Tunnel`/`Child`
+/// got abandoned on some other (never-returning) thread.
+#[cfg(unix)]
+pub fn kill_all_registered() {
+    let pids: Vec<u32> = LIVE_CHILDREN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .drain()
+        .collect();
+    for pid in pids {
+        let _ = std::process::Command::new("kill")
+            .arg("-KILL")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+#[cfg(not(unix))]
+pub fn kill_all_registered() {}
 
 // How long to wait, before ever spawning ssh, when checking whether a
 // just-reserved local port is already held by something else (see
@@ -331,6 +387,8 @@ impl Tunnel {
                 source,
             })?;
 
+        register_child(child.id());
+
         let stderr = Arc::new(Mutex::new(StderrCapture::default()));
         let child_stderr = child.stderr.take().expect("stderr was configured as piped");
         let forward_confirmed = Arc::new(AtomicBool::new(false));
@@ -405,16 +463,15 @@ impl Tunnel {
                 return Ok(());
             }
 
-            let probe_ok = match TcpStream::connect_timeout(
-                &self.local_addr(),
-                options.probe_connect_timeout,
-            ) {
-                Ok(stream) => {
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
-                    true
-                }
-                Err(_) => false,
-            };
+            let probe_ok =
+                match TcpStream::connect_timeout(&self.local_addr(), options.probe_connect_timeout)
+                {
+                    Ok(stream) => {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        true
+                    }
+                    Err(_) => false,
+                };
 
             if probe_ok {
                 let since = *first_probe_success.get_or_insert_with(Instant::now);
@@ -460,6 +517,14 @@ impl Tunnel {
     /// means once `open`/`open_with` has already returned `Ok`.
     pub fn forward_confirmed(&self) -> bool {
         self.forward_confirmed.load(Ordering::Acquire)
+    }
+
+    /// A clone of the same atomic `forward_confirmed()` reads/writes, so a
+    /// caller can poll confirmation status without taking any lock on the
+    /// `Tunnel` itself -- see `PostgresDataSource`'s `tunnel_forward_confirmed`
+    /// field, which holds exactly this to keep the render path lock-free.
+    pub fn forward_confirmed_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.forward_confirmed)
     }
 
     pub fn check_alive(&mut self) -> Result<(), TunnelError> {
@@ -518,6 +583,16 @@ impl Tunnel {
     // stderr_tail(); the thread exits on its own whenever its read end
     // eventually reaches EOF and is not otherwise waited on.
     fn terminate(&mut self) {
+        // Deregister before kill()/wait(), not after: wait() reaps the pid,
+        // and the OS is free to hand a reaped pid to an unrelated process
+        // immediately. Deregistering first means kill_all_registered()'s
+        // safety net can never observe (and signal) a pid this Tunnel has
+        // already given back to the OS. Runs on both the normal Drop path
+        // and the explicit shutdown() path, so a cleanly-closed tunnel never
+        // lingers in the registry -- see LIVE_CHILDREN's doc comment for
+        // what this is a safety net for.
+        deregister_child(self.child.id());
+
         let still_running = matches!(self.child.try_wait(), Ok(None));
         if still_running {
             let _ = self.child.kill();

@@ -32,3 +32,7 @@ keyring = "4"
 
 [dev-dependencies]
 tempfile = "3"
+# Cargo unifies features for a crate shared between normal and dev
+# dependencies, so this only adds `pause`/`advance` to test builds -- the
+# production `tokio` dependency above is unaffected.
+tokio = { version = "1.53", features = ["test-util"] }

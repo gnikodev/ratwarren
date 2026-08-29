@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -63,6 +63,20 @@ pub struct PostgresDataSource {
     conn_error: Arc<Mutex<Option<String>>>,
     cancel_token: tokio_postgres::CancelToken,
     tunnel: Option<Mutex<Tunnel>>,
+    // Cheap copies pulled out of `tunnel` at construction time so
+    // `tunnel_local_port`/`tunnel_forward_confirmed` -- called every frame
+    // per Ready session, from `Session::tab_title`/`tunnel_warning` -- never
+    // have to take `tunnel`'s `Mutex`. That matters because
+    // `Tunnel::check_alive`'s error path can hold that lock through a ~50ms
+    // sleep (`wait_for_stderr_drain`); once anything calls `check_alive` from
+    // a background task (e.g. a future activity monitor), contending on the
+    // same lock from the render path would cause an intermittent ~50ms UI
+    // freeze. `local_port` never changes after a tunnel opens, so a plain
+    // `u16` copy suffices; `forward_confirmed` is read continuously as the
+    // tunnel's own reader thread updates it, so this holds the same `Arc`
+    // `Tunnel` itself updates, not a snapshot.
+    tunnel_local_port: Option<u16>,
+    tunnel_forward_confirmed: Option<Arc<AtomicBool>>,
     slot: Arc<Semaphore>,
     next_id: AtomicU64,
     active_id: Arc<AtomicU64>,
@@ -163,6 +177,9 @@ impl PostgresDataSource {
 
         let cancel_token = client.cancel_token();
 
+        let tunnel_local_port = tunnel.as_ref().map(Tunnel::local_port);
+        let tunnel_forward_confirmed = tunnel.as_ref().map(Tunnel::forward_confirmed_handle);
+
         let conn_error = Arc::new(Mutex::new(None));
         let conn_error_task = Arc::clone(&conn_error);
         let conn_task = tokio::spawn(async move {
@@ -182,6 +199,8 @@ impl PostgresDataSource {
             conn_error,
             cancel_token,
             tunnel: tunnel.map(Mutex::new),
+            tunnel_local_port,
+            tunnel_forward_confirmed,
             slot: Arc::new(Semaphore::new(1)),
             next_id: AtomicU64::new(1),
             active_id: Arc::new(AtomicU64::new(0)),
@@ -212,21 +231,17 @@ impl PostgresDataSource {
     }
 
     pub fn tunnel_local_port(&self) -> Option<u16> {
-        self.tunnel.as_ref().map(|t| {
-            t.lock()
-                .expect("tunnel mutex should not be poisoned")
-                .local_port()
-        })
+        self.tunnel_local_port
     }
 
     /// `None` when there is no tunnel at all (nothing to confirm); `Some(false)`
     /// is the T2 unconfirmed-tunnel case the UI shows a sticky warning for.
+    /// Lock-free: reads the same `Arc<AtomicBool>` `Tunnel` itself updates,
+    /// never `tunnel`'s `Mutex` -- see that field's doc comment for why.
     pub fn tunnel_forward_confirmed(&self) -> Option<bool> {
-        self.tunnel.as_ref().map(|t| {
-            t.lock()
-                .expect("tunnel mutex should not be poisoned")
-                .forward_confirmed()
-        })
+        self.tunnel_forward_confirmed
+            .as_ref()
+            .map(|flag| flag.load(Ordering::Acquire))
     }
 
     pub async fn close(self) {

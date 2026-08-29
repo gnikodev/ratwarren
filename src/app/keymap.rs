@@ -16,6 +16,10 @@ pub enum AppCommand {
     Editor(EditorCommand),
     Run(RunKey),
     CancelOrQuit,
+    OpenPicker,
+    CloseTab,
+    NextTab,
+    PrevTab,
 }
 
 pub enum RunKey {
@@ -40,6 +44,13 @@ pub fn map_key(key: KeyEvent, focus: Focus) -> Option<AppCommand> {
         (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
             return Some(AppCommand::Run(RunKey::Buffer));
         }
+        // Tab management is bound globally, including in `Focus::Editor`
+        // where bare printable characters otherwise insert -- these four
+        // must never be shadowed by a session's own keymap.
+        (KeyCode::Char('t'), KeyModifiers::CONTROL) => return Some(AppCommand::OpenPicker),
+        (KeyCode::Char('w'), KeyModifiers::CONTROL) => return Some(AppCommand::CloseTab),
+        (KeyCode::Char('n'), KeyModifiers::CONTROL) => return Some(AppCommand::NextTab),
+        (KeyCode::Char('p'), KeyModifiers::CONTROL) => return Some(AppCommand::PrevTab),
         _ => {}
     }
 
@@ -144,6 +155,10 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
     }
 
     // The same physical key must route to different AppCommand variants
@@ -281,6 +296,61 @@ mod tests {
             map_key(key(KeyCode::Left), Focus::Editor),
             Some(AppCommand::Editor(EditorCommand::Left(Motion::Move)))
         ));
+    }
+
+    // Phase 2: Ctrl+T/W/N/P must map to the tab commands in all three
+    // `Focus` values -- in particular they must never be shadowed by
+    // `Focus::Editor`'s bare-printable-character insert branch, since 't',
+    // 'w', 'n', and 'p' are all otherwise ordinary letters a user would type.
+    #[test]
+    fn tab_management_keys_map_regardless_of_focus() {
+        for focus in [Focus::Tree, Focus::Grid, Focus::Editor] {
+            assert!(
+                matches!(
+                    map_key(ctrl_key(KeyCode::Char('t')), focus),
+                    Some(AppCommand::OpenPicker)
+                ),
+                "Ctrl+T must open the picker in {focus:?}"
+            );
+            assert!(
+                matches!(
+                    map_key(ctrl_key(KeyCode::Char('w')), focus),
+                    Some(AppCommand::CloseTab)
+                ),
+                "Ctrl+W must close the tab in {focus:?}"
+            );
+            assert!(
+                matches!(
+                    map_key(ctrl_key(KeyCode::Char('n')), focus),
+                    Some(AppCommand::NextTab)
+                ),
+                "Ctrl+N must switch to the next tab in {focus:?}"
+            );
+            assert!(
+                matches!(
+                    map_key(ctrl_key(KeyCode::Char('p')), focus),
+                    Some(AppCommand::PrevTab)
+                ),
+                "Ctrl+P must switch to the previous tab in {focus:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_management_letters_without_ctrl_still_insert_in_editor_focus() {
+        // The direct contrast that makes the test above meaningful: the very
+        // same letters, without Ctrl, must behave as ordinary editor input in
+        // `Focus::Editor` -- Ctrl+T/W/N/P must not have quietly repurposed
+        // 't'/'w'/'n'/'p' themselves.
+        for c in ['t', 'w', 'n', 'p'] {
+            assert!(
+                matches!(
+                    map_key(key(KeyCode::Char(c)), Focus::Editor),
+                    Some(AppCommand::Editor(EditorCommand::Insert(got))) if got == c
+                ),
+                "bare {c:?} in Focus::Editor must insert, not be captured by tab management"
+            );
+        }
     }
 
     #[test]
