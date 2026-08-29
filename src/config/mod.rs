@@ -76,6 +76,8 @@ fn default_postgres_port() -> u16 {
 pub enum ConfigError {
     #[error("could not determine a config directory for this platform")]
     NoConfigDir,
+    #[error("could not determine a data directory for this platform")]
+    NoDataDir,
     #[error("failed to read config file {}", path.display())]
     Read {
         path: PathBuf,

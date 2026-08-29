@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod datasource;
 pub mod editor;
+pub mod pages;
 pub mod secret;
 pub mod tunnel;
 pub mod ui;

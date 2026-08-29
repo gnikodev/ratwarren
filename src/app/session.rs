@@ -5,7 +5,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Tabs, Wrap};
 #[cfg(test)]
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 
 use crate::datasource::{ConnectOptions, DataSource, DataSourceError, PostgresDataSource};
 use crate::editor::{Motion, RunTarget};
+use crate::pages::{PageTabs, PagesError};
 use crate::ui::editor::EditorState;
 use crate::ui::editor::widget::EditorWidget;
 use crate::ui::grid::state::DataGridState;
@@ -160,8 +161,17 @@ pub struct Session {
     pub group: Option<String>,
     tree: ObjectTreeState,
     grid: DataGridState,
-    editor: EditorState,
+    pages: PageTabs,
     run: RunState,
+    // Which page (by index into `pages.tabs()`) the currently in-flight run
+    // was started from. Guards `jump_to_error_position`: if the user has
+    // switched pages by the time an error response arrives, the page whose
+    // buffer the error's byte offset refers to is no longer the one on
+    // screen, so jumping the cursor there would silently edit the wrong
+    // page. Cleared whenever a run finishes or a page closes (page indices
+    // shift on close, so a stale index could otherwise alias a different
+    // page entirely).
+    run_page: Option<usize>,
     status: Option<Status>,
     focus: Focus,
     state: SessionState,
@@ -169,14 +179,29 @@ pub struct Session {
 
 impl Session {
     pub fn new(id: SessionId, connection_name: String, group: Option<String>) -> Session {
+        let pages = PageTabs::restore(&connection_name);
+        Session::new_with_pages(id, connection_name, group, pages)
+    }
+
+    /// Test seam: `PageTabs::restore` can only be bypassed by supplying an
+    /// already-constructed `PageTabs` (e.g. `PageTabs::detached()`), since
+    /// the real constructor resolves and touches the platform data
+    /// directory.
+    pub fn new_with_pages(
+        id: SessionId,
+        connection_name: String,
+        group: Option<String>,
+        pages: PageTabs,
+    ) -> Session {
         Session {
             id,
             connection_name,
             group,
             tree: ObjectTreeState::new(),
             grid: DataGridState::new(),
-            editor: EditorState::new(),
+            pages,
             run: RunState::new(),
+            run_page: None,
             status: None,
             focus: Focus::Tree,
             state: SessionState::Connecting {
@@ -215,6 +240,71 @@ impl Session {
             Focus::Grid => GRID_FOOTER,
             Focus::Editor => EDITOR_FOOTER,
         }
+    }
+
+    pub fn pages(&self) -> &PageTabs {
+        &self.pages
+    }
+
+    pub fn pages_mut(&mut self) -> &mut PageTabs {
+        &mut self.pages
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.pages.any_dirty()
+    }
+
+    pub fn dirty_titles(&self) -> Vec<String> {
+        self.pages.dirty_titles()
+    }
+
+    /// The active page's buffer, delegated through `pages` -- kept private
+    /// so every other call site in this module reads exactly like it did
+    /// before pages existed, with `self.editor()`/`self.editor_mut()` in
+    /// place of the old `self.editor` field access.
+    fn editor(&self) -> &EditorState {
+        self.pages.editor()
+    }
+
+    fn editor_mut(&mut self) -> &mut EditorState {
+        self.pages.editor_mut()
+    }
+
+    /// Closes the active page, refusing (returning `Ok(false)`) if it's
+    /// dirty and `force` is `false` -- the caller must re-invoke with
+    /// `force: true` after confirming with the user. Always clears
+    /// `run_page` on an actual close, since page indices shift.
+    pub fn close_page(&mut self, force: bool) -> Result<bool, PagesError> {
+        let closed = self.pages.close_active(force)?;
+        if closed {
+            self.run_page = None;
+        }
+        Ok(closed)
+    }
+
+    /// Deletes `name` (from disk, and its tab if it's open) via
+    /// `PageTabs::delete`, then clears `run_page` the same way `close_page`
+    /// does -- `PageTabs::delete` closes the deleted page's tab internally
+    /// (`PageTabs::close_at`, not `close_active`), which is exactly the kind
+    /// of index-shifting close `run_page`'s doc comment says must clear it.
+    /// Deliberately unconditional (not gated on whether `name` happened to be
+    /// open) since it's always safe and this is not a hot path.
+    pub fn delete_page(&mut self, name: &crate::pages::PageName) -> Result<(), PagesError> {
+        self.pages.delete(name)?;
+        self.run_page = None;
+        Ok(())
+    }
+
+    /// Lets `App` report a page-operation outcome (save/open/rename/close
+    /// error or success) on this session's own status line, the same one
+    /// `on_key`/`start_run` already use -- without exposing the `status`
+    /// field itself.
+    pub fn set_error_status(&mut self, message: String) {
+        self.status = Some(Status::error(message));
+    }
+
+    pub fn set_info_status(&mut self, message: String) {
+        self.status = Some(Status::info(message));
     }
 
     /// Consumes `self` to hand back its `SessionState` for teardown --
@@ -318,12 +408,12 @@ impl Session {
                 }
             }
             Some(AppCommand::Editor(cmd)) => {
-                self.editor.command(cmd);
+                self.editor_mut().command(cmd);
             }
             Some(AppCommand::Run(key)) => {
                 let target = match key {
                     RunKey::CursorOrSelection => {
-                        if self.editor.buffer().selection().is_some() {
+                        if self.editor().buffer().selection().is_some() {
                             RunTarget::Selection
                         } else {
                             RunTarget::Cursor
@@ -343,12 +433,21 @@ impl Session {
                 }
                 None => return Some(SessionAction::Quit),
             },
-            // Tab commands are intercepted by `App::on_key` before a session
-            // ever sees them; kept here only so this match stays exhaustive.
+            // Tab/page-tab commands are intercepted by `App::on_key` before a
+            // session ever sees them; kept here only so this match stays
+            // exhaustive.
             Some(AppCommand::OpenPicker)
             | Some(AppCommand::CloseTab)
             | Some(AppCommand::NextTab)
-            | Some(AppCommand::PrevTab) => {}
+            | Some(AppCommand::PrevTab)
+            | Some(AppCommand::OpenPageList)
+            | Some(AppCommand::SavePage)
+            | Some(AppCommand::RenamePage)
+            | Some(AppCommand::NewPage)
+            | Some(AppCommand::ClosePage)
+            | Some(AppCommand::NextPage)
+            | Some(AppCommand::PrevPage)
+            | Some(AppCommand::ReloadPage) => {}
             None => {}
         }
         None
@@ -370,17 +469,18 @@ impl Session {
             self.status = Some(Status::info("a query is already running"));
             return;
         }
-        match crate::editor::plan_run(self.editor.buffer(), target) {
+        match crate::editor::plan_run(self.editor().buffer(), target) {
             Err(split_err) => {
                 self.status = Some(Status::error(split_err.message.clone()));
-                let pos = self.editor.buffer().position_of(split_err.span.start);
-                self.editor.buffer_mut().move_to(pos, Motion::Move);
+                let pos = self.editor().buffer().position_of(split_err.span.start);
+                self.editor_mut().buffer_mut().move_to(pos, Motion::Move);
             }
             Ok(units) if units.is_empty() => {
                 self.status = Some(Status::info("nothing to run"));
             }
             Ok(units) => {
                 if let Some(req) = self.run.start(units) {
+                    self.run_page = Some(self.pages.active_index());
                     self.grid.begin_query(req.id, title_of(&req.sql));
                     self.send(WorkerRequest::Query(req));
                     self.status = Some(running_status(&self.run));
@@ -421,6 +521,7 @@ impl Session {
                         self.status = Some(running_status(&self.run));
                     }
                     Some(RunOutcome::Done(summary)) => {
+                        self.run_page = None;
                         let mut status = summary_status(&summary);
                         if !displayed {
                             status.text.push_str(" · result not shown (grid moved on)");
@@ -439,15 +540,25 @@ impl Session {
     }
 
     fn jump_to_error_position(&mut self, unit: &crate::editor::RunUnit, err: &DataSourceError) {
+        // The run this error belongs to was started from a different page
+        // than the one currently active (the user switched pages while it
+        // was in flight) -- the byte offset in `unit`/`err` refers to that
+        // other page's buffer, not this one, so jumping here would silently
+        // edit the wrong page.
+        if self.run_page != Some(self.pages.active_index()) {
+            return;
+        }
         let Some(pos) = err.error_position() else {
             return;
         };
-        let text = self.editor.buffer().text();
+        let text = self.editor().buffer().text();
         let Some(offset) = error_offset(&text, unit, pos) else {
             return;
         };
-        let buffer_pos = self.editor.buffer().position_of(offset);
-        self.editor.buffer_mut().move_to(buffer_pos, Motion::Move);
+        let buffer_pos = self.editor().buffer().position_of(offset);
+        self.editor_mut()
+            .buffer_mut()
+            .move_to(buffer_pos, Motion::Move);
     }
 
     fn activate(&mut self) {
@@ -528,12 +639,17 @@ impl Session {
         let tree_area = panes[0];
         let right_area = panes[1];
 
+        let right_rows =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(right_area);
+        let page_tabs_area = right_rows[0];
+        let editor_and_grid_area = right_rows[1];
+
         let (editor_area, grid_area) = if self.grid.is_open() {
             let rows = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(right_area);
+                .split(editor_and_grid_area);
             (rows[0], Some(rows[1]))
         } else {
-            (right_area, None)
+            (editor_and_grid_area, None)
         };
 
         let tree_style = pane_border_style(self.focus == Focus::Tree);
@@ -545,15 +661,33 @@ impl Session {
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         frame.render_stateful_widget(tree_widget, tree_area, &mut self.tree);
 
+        let page_titles: Vec<Line> = self
+            .pages
+            .tabs()
+            .iter()
+            .map(|page| {
+                let text = if page.is_dirty() {
+                    format!(" {}* ", page.title())
+                } else {
+                    format!(" {} ", page.title())
+                };
+                Line::from(text)
+            })
+            .collect();
+        let page_tabs = Tabs::new(page_titles)
+            .select(Some(self.pages.active_index()))
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        frame.render_widget(page_tabs, page_tabs_area);
+
         let editor_style = pane_border_style(self.focus == Focus::Editor);
         let editor_block = Block::bordered()
             .border_style(editor_style)
             .title(" editor ");
         let editor_inner = editor_block.inner(editor_area);
         let editor_widget = EditorWidget::new().block(editor_block);
-        frame.render_stateful_widget(editor_widget, editor_area, &mut self.editor);
+        frame.render_stateful_widget(editor_widget, editor_area, self.pages.editor_mut());
         if self.focus == Focus::Editor
-            && let Some(pos) = self.editor.cursor_screen_pos(editor_inner)
+            && let Some(pos) = self.editor().cursor_screen_pos(editor_inner)
         {
             frame.set_cursor_position(pos);
         }
@@ -591,7 +725,15 @@ pub(crate) fn test_ready_session(
 ) {
     let (req_tx, req_rx) = unbounded_channel();
     let (cancel_tx, cancel_rx) = unbounded_channel();
-    let mut session = Session::new(id, connection_name, group);
+    // `new_with_pages` + `PageTabs::detached()`, not `Session::new`: the real
+    // constructor calls `PageTabs::restore`, which touches the platform data
+    // directory -- undesirable in a unit test.
+    let mut session = Session::new_with_pages(
+        id,
+        connection_name,
+        group,
+        crate::pages::PageTabs::detached(),
+    );
     session.state = SessionState::TestReady {
         requests: req_tx,
         cancels: cancel_tx,
@@ -602,11 +744,11 @@ pub(crate) fn test_ready_session(
 #[cfg(test)]
 impl Session {
     pub(crate) fn set_editor_text_for_test(&mut self, text: &str) {
-        *self.editor.buffer_mut() = crate::editor::TextBuffer::from_text(text);
+        *self.editor_mut().buffer_mut() = crate::editor::TextBuffer::from_text(text);
     }
 
     pub(crate) fn editor_text_for_test(&self) -> String {
-        self.editor.buffer().text()
+        self.editor().buffer().text()
     }
 
     pub(crate) fn run_is_active_for_test(&self) -> bool {
@@ -805,7 +947,12 @@ mod tests {
     ) {
         let (req_tx, req_rx) = unbounded_channel();
         let (cancel_tx, cancel_rx) = unbounded_channel();
-        let mut session = Session::new(SessionId(0), "test".to_string(), None);
+        let mut session = Session::new_with_pages(
+            SessionId(0),
+            "test".to_string(),
+            None,
+            crate::pages::PageTabs::detached(),
+        );
         session.state = SessionState::TestReady {
             requests: req_tx,
             cancels: cancel_tx,
@@ -852,7 +999,8 @@ mod tests {
     #[test]
     fn run_key_sets_an_already_running_status_and_it_survives_the_same_dispatch() {
         let (mut session, _req_rx, _cancel_rx) = new_session();
-        *session.editor.buffer_mut() = crate::editor::TextBuffer::from_text("SELECT pg_sleep(1)");
+        *session.editor_mut().buffer_mut() =
+            crate::editor::TextBuffer::from_text("SELECT pg_sleep(1)");
         session.start_run(RunTarget::Buffer);
         assert!(
             session.run.is_active(),
@@ -871,7 +1019,7 @@ mod tests {
     #[test]
     fn starting_a_multi_statement_run_shows_progress_in_the_status_bar() {
         let (mut session, _req_rx, _cancel_rx) = new_session();
-        *session.editor.buffer_mut() =
+        *session.editor_mut().buffer_mut() =
             crate::editor::TextBuffer::from_text("SELECT 1; SELECT 2; SELECT 3;");
         session.start_run(RunTarget::Buffer);
         let status = session
@@ -884,7 +1032,7 @@ mod tests {
     #[test]
     fn a_single_statement_run_shows_a_plain_running_message() {
         let (mut session, _req_rx, _cancel_rx) = new_session();
-        *session.editor.buffer_mut() = crate::editor::TextBuffer::from_text("SELECT 1;");
+        *session.editor_mut().buffer_mut() = crate::editor::TextBuffer::from_text("SELECT 1;");
         session.start_run(RunTarget::Buffer);
         let status = session
             .status
@@ -896,7 +1044,7 @@ mod tests {
     #[test]
     fn a_keypress_during_an_active_run_does_not_wipe_the_progress_message() {
         let (mut session, _req_rx, _cancel_rx) = new_session();
-        *session.editor.buffer_mut() =
+        *session.editor_mut().buffer_mut() =
             crate::editor::TextBuffer::from_text("SELECT 1; SELECT 2; SELECT 3;");
         session.start_run(RunTarget::Buffer);
         assert!(
@@ -915,7 +1063,7 @@ mod tests {
     #[test]
     fn the_final_summary_replaces_the_progress_message() {
         let (mut session, mut req_rx, _cancel_rx) = new_session();
-        *session.editor.buffer_mut() = crate::editor::TextBuffer::from_text("SELECT 1;");
+        *session.editor_mut().buffer_mut() = crate::editor::TextBuffer::from_text("SELECT 1;");
         session.start_run(RunTarget::Buffer);
         let req = match req_rx.try_recv().expect("start_run must send a request") {
             WorkerRequest::Query(req) => req,
@@ -966,7 +1114,12 @@ mod tests {
         // would be vacuous here regardless of this fix, since `Connecting`
         // carries no channel at all to send on in the first place (`send`
         // already no-ops for it independently of `is_ready()`).
-        let mut session = Session::new(SessionId(0), "test".to_string(), None);
+        let mut session = Session::new_with_pages(
+            SessionId(0),
+            "test".to_string(),
+            None,
+            crate::pages::PageTabs::detached(),
+        );
         assert!(
             matches!(session.state, SessionState::Connecting { .. }),
             "test setup precondition"
@@ -984,7 +1137,12 @@ mod tests {
 
     #[test]
     fn start_run_is_a_noop_on_a_failed_session() {
-        let mut session = Session::new(SessionId(0), "test".to_string(), None);
+        let mut session = Session::new_with_pages(
+            SessionId(0),
+            "test".to_string(),
+            None,
+            crate::pages::PageTabs::detached(),
+        );
         session.on_failed("connection refused".to_string());
         assert!(
             matches!(session.state, SessionState::Failed { .. }),
@@ -1054,8 +1212,8 @@ mod tests {
         // `jump_to_error_position` returns immediately when
         // `error_position()` is `None`.
         let (mut session, _req_rx, _cancel_rx) = new_session();
-        *session.editor.buffer_mut() = crate::editor::TextBuffer::from_text("SELECT 1");
-        let before = session.editor.buffer().cursor();
+        *session.editor_mut().buffer_mut() = crate::editor::TextBuffer::from_text("SELECT 1");
+        let before = session.editor().buffer().cursor();
 
         let unit = crate::editor::RunUnit {
             sql: "SELECT 1".to_string(),
@@ -1072,7 +1230,7 @@ mod tests {
             assert_eq!(err.error_position(), None, "test setup precondition");
             session.jump_to_error_position(&unit, &err);
             assert_eq!(
-                session.editor.buffer().cursor(),
+                session.editor().buffer().cursor(),
                 before,
                 "a DataSourceError with no error_position() must never move the cursor"
             );
@@ -1081,7 +1239,12 @@ mod tests {
 
     #[test]
     fn tunnel_warning_is_none_while_connecting() {
-        let session = Session::new(SessionId(0), "test".to_string(), None);
+        let session = Session::new_with_pages(
+            SessionId(0),
+            "test".to_string(),
+            None,
+            crate::pages::PageTabs::detached(),
+        );
         assert!(matches!(session.state, SessionState::Connecting { .. }));
         assert_eq!(
             session.tunnel_warning(),
@@ -1093,7 +1256,12 @@ mod tests {
 
     #[test]
     fn tunnel_warning_is_none_while_failed() {
-        let mut session = Session::new(SessionId(0), "test".to_string(), None);
+        let mut session = Session::new_with_pages(
+            SessionId(0),
+            "test".to_string(),
+            None,
+            crate::pages::PageTabs::detached(),
+        );
         session.on_failed("connection refused".to_string());
         assert!(matches!(session.state, SessionState::Failed { .. }));
         assert_eq!(
@@ -1163,7 +1331,7 @@ mod tests {
     #[test]
     fn stale_cancel_failed_from_a_finished_run_is_ignored_and_does_not_clobber_a_new_runs_status() {
         let (mut session, mut req_rx, _cancel_rx) = new_session();
-        *session.editor.buffer_mut() = crate::editor::TextBuffer::from_text("SELECT 1;");
+        *session.editor_mut().buffer_mut() = crate::editor::TextBuffer::from_text("SELECT 1;");
         session.start_run(RunTarget::Buffer);
         let req1 = match req_rx.try_recv().expect("start_run must send a request") {
             WorkerRequest::Query(req) => req,
@@ -1202,7 +1370,7 @@ mod tests {
 
         // Start a brand-new run (mints a fresh RequestId) and confirm the
         // stale CancelFailed doesn't resurface / clobber it either.
-        *session.editor.buffer_mut() = crate::editor::TextBuffer::from_text("SELECT 2;");
+        *session.editor_mut().buffer_mut() = crate::editor::TextBuffer::from_text("SELECT 2;");
         session.start_run(RunTarget::Buffer);
         let running_text = session
             .status
@@ -1237,7 +1405,8 @@ mod tests {
         // only accurate in the `Done` branch, where nothing subsequent
         // re-claims the grid (see the sibling test below for that case).
         let (mut session, mut req_rx, _cancel_rx) = new_session();
-        *session.editor.buffer_mut() = crate::editor::TextBuffer::from_text("SELECT 1; SELECT 2;");
+        *session.editor_mut().buffer_mut() =
+            crate::editor::TextBuffer::from_text("SELECT 1; SELECT 2;");
         session.start_run(RunTarget::Buffer);
         let req1 = match req_rx.try_recv().expect("start_run must send a request") {
             WorkerRequest::Query(req) => req,
@@ -1280,7 +1449,7 @@ mod tests {
     #[test]
     fn grid_moved_on_note_is_appended_when_the_final_statements_result_is_discarded() {
         let (mut session, mut req_rx, _cancel_rx) = new_session();
-        *session.editor.buffer_mut() = crate::editor::TextBuffer::from_text("SELECT 1;");
+        *session.editor_mut().buffer_mut() = crate::editor::TextBuffer::from_text("SELECT 1;");
         session.start_run(RunTarget::Buffer);
         let req1 = match req_rx.try_recv().expect("start_run must send a request") {
             WorkerRequest::Query(req) => req,
@@ -1453,5 +1622,230 @@ mod tests {
 
         join.abort();
         let _ = join.await;
+    }
+
+    // --- Phase 3: Session::pages()/is_dirty()/dirty_titles()/close_page() ---
+
+    fn new_session_with_pages(
+        pages: crate::pages::PageTabs,
+    ) -> (
+        Session,
+        UnboundedReceiver<WorkerRequest>,
+        UnboundedReceiver<CancelRequest>,
+    ) {
+        let (req_tx, req_rx) = unbounded_channel();
+        let (cancel_tx, cancel_rx) = unbounded_channel();
+        let mut session = Session::new_with_pages(SessionId(0), "test".to_string(), None, pages);
+        session.state = SessionState::TestReady {
+            requests: req_tx,
+            cancels: cancel_tx,
+        };
+        (session, req_rx, cancel_rx)
+    }
+
+    #[test]
+    fn a_fresh_session_has_one_non_dirty_scratch_page() {
+        let (session, _req_rx, _cancel_rx) = new_session();
+        assert!(!session.is_dirty());
+        assert!(session.dirty_titles().is_empty());
+        assert_eq!(session.pages().tabs().len(), 1);
+    }
+
+    #[test]
+    fn editing_the_active_page_makes_the_session_dirty_and_names_it() {
+        let (mut session, _req_rx, _cancel_rx) = new_session();
+        session.set_editor_text_for_test("some sql");
+        assert!(session.is_dirty());
+        assert_eq!(session.dirty_titles(), vec!["scratch".to_string()]);
+    }
+
+    #[test]
+    fn close_page_without_force_on_a_dirty_page_returns_ok_false_and_removes_nothing() {
+        let (mut session, _req_rx, _cancel_rx) = new_session();
+        session.set_editor_text_for_test("dirty");
+
+        let result = session.close_page(false).expect("must not error");
+
+        assert!(!result);
+        assert!(session.is_dirty(), "the dirty page must still be there");
+    }
+
+    #[test]
+    fn close_page_with_force_removes_the_page_and_clears_run_page() {
+        let (mut session, mut req_rx, _cancel_rx) = new_session();
+        session.set_editor_text_for_test("SELECT 1;");
+        session.start_run(RunTarget::Buffer);
+        assert_eq!(
+            session.run_page,
+            Some(0),
+            "test setup: start_run must record the page it ran from"
+        );
+        let _ = req_rx.try_recv();
+
+        let result = session.close_page(true).expect("must not error");
+
+        assert!(result);
+        assert_eq!(
+            session.run_page, None,
+            "closing a page must clear run_page since page indices shift"
+        );
+    }
+
+    #[test]
+    fn delete_page_clears_run_page_since_indices_shift() {
+        // Regression test for the code-review finding that `run_pending_action`'s
+        // `DeletePage` branch used to call `pages_mut().delete(..)` directly,
+        // bypassing the `run_page`-clearing invariant `close_page` upholds.
+        // Deletes a page *before* the one a run is in flight from, so a stale
+        // `run_page` would now alias a different page entirely.
+        let tmp = tempfile::tempdir().expect("tempdir creation");
+        let dir = crate::pages::PagesDir::at(tmp.path().to_path_buf());
+        let sidecar_path = tmp.path().join("missing.tabs.toml");
+        let pages = crate::pages::PageTabs::restore_in(dir, sidecar_path);
+        let (mut session, mut req_rx, _cancel_rx) = new_session_with_pages(pages);
+
+        let name_a = crate::pages::PageName::new("a.sql").unwrap();
+        session
+            .pages_mut()
+            .save_active_as(&name_a)
+            .expect("save_active_as should succeed");
+        session.pages_mut().new_scratch();
+        assert_eq!(session.pages.active_index(), 1, "test setup");
+        session.set_editor_text_for_test("SELECT 1;");
+        session.start_run(RunTarget::Buffer);
+        assert_eq!(
+            session.run_page,
+            Some(1),
+            "test setup: the run started from the second (scratch) page"
+        );
+        let _ = req_rx.try_recv();
+
+        session
+            .delete_page(&name_a)
+            .expect("deleting a.sql should succeed");
+
+        assert_eq!(
+            session.run_page, None,
+            "deleting a page must clear run_page since page indices shift, the same invariant \
+             close_page upholds"
+        );
+    }
+
+    #[test]
+    fn starting_a_run_records_the_active_page_index_in_run_page() {
+        let (mut session, _req_rx, _cancel_rx) = new_session();
+        session.pages_mut().new_scratch();
+        assert_eq!(session.pages.active_index(), 1, "test setup");
+        session.set_editor_text_for_test("SELECT 1;");
+
+        session.start_run(RunTarget::Buffer);
+
+        assert_eq!(session.run_page, Some(1));
+    }
+
+    #[test]
+    fn a_finished_run_clears_run_page() {
+        let (mut session, mut req_rx, _cancel_rx) = new_session();
+        session.set_editor_text_for_test("SELECT 1;");
+        session.start_run(RunTarget::Buffer);
+        let req = match req_rx.try_recv().expect("start_run must send a request") {
+            WorkerRequest::Query(req) => req,
+            WorkerRequest::Tree(_) | WorkerRequest::Grid(_) => panic!("expected a Query request"),
+        };
+        assert_eq!(session.run_page, Some(0), "test setup");
+
+        session.apply(WorkerResponse::Query(run::QueryResponse::Finished {
+            id: req.id,
+            result: Ok(run::QueryOutcome::NoResultSet { rows_affected: 0 }),
+        }));
+
+        assert_eq!(
+            session.run_page, None,
+            "run_page must be cleared once the run is done, since it no longer refers to an \
+             in-flight run"
+        );
+    }
+
+    #[test]
+    fn jump_to_error_position_is_a_noop_when_run_page_no_longer_matches_the_active_page() {
+        // Reproduces the scenario `run_page`'s doc comment exists to guard:
+        // the run was started from one page, but the user has since switched
+        // to another before the (here: position-less, since a real
+        // `DataSourceError::Query` position can't be constructed outside a
+        // live Postgres connection -- see the sibling
+        // `jump_to_error_position_is_a_noop_for_error_variants_without_a_position`
+        // test's comment) response arrives. The cursor must stay put on the
+        // now-active page's own buffer.
+        let (mut session, _req_rx, _cancel_rx) = new_session();
+        session.pages_mut().new_scratch();
+        session.pages_mut().select(0);
+        session.set_editor_text_for_test("SELECT 1;");
+        session.start_run(RunTarget::Buffer);
+        assert_eq!(session.run_page, Some(0), "test setup");
+
+        session.pages_mut().select(1);
+        assert_ne!(
+            session.run_page,
+            Some(session.pages.active_index()),
+            "test setup: the active page must have changed since the run started"
+        );
+        let before = session.editor().buffer().cursor();
+
+        let unit = crate::editor::RunUnit {
+            sql: "SELECT 1;".to_string(),
+            span: crate::editor::ByteSpan { start: 0, end: 9 },
+            start: crate::editor::Position::default(),
+        };
+        session.jump_to_error_position(&unit, &DataSourceError::Cancelled);
+
+        assert_eq!(
+            session.editor().buffer().cursor(),
+            before,
+            "a run_page/active-page mismatch must leave the (different) active page's cursor \
+             untouched"
+        );
+    }
+
+    #[test]
+    fn no_page_operation_ever_dispatches_a_worker_request() {
+        let tmp = tempfile::tempdir().expect("tempdir creation");
+        let dir = crate::pages::PagesDir::at(tmp.path().to_path_buf());
+        let sidecar_path = tmp.path().join("missing.tabs.toml");
+        let pages = crate::pages::PageTabs::restore_in(dir, sidecar_path);
+        let (mut session, mut req_rx, _cancel_rx) = new_session_with_pages(pages);
+
+        let name_a = crate::pages::PageName::new("a.sql").unwrap();
+        session
+            .pages_mut()
+            .save_active_as(&name_a)
+            .expect("save_active_as should succeed");
+        session.pages_mut().new_scratch();
+        let name_b = crate::pages::PageName::new("b.sql").unwrap();
+        session
+            .pages_mut()
+            .save_active_as(&name_b)
+            .expect("save_active_as should succeed");
+        session.pages_mut().next();
+        session.pages_mut().prev();
+        session.pages_mut().select(0);
+        session
+            .pages_mut()
+            .open(&name_b)
+            .expect("opening an already-open page should succeed");
+        let name_b2 = crate::pages::PageName::new("b2.sql").unwrap();
+        session
+            .pages_mut()
+            .rename_active(&name_b2)
+            .expect("rename should succeed");
+        let _ = session.close_page(true);
+        let _ = session.pages_mut().delete(&name_a);
+        let _ = session.pages_mut().list_available();
+        let _ = session.pages_mut().reload_active();
+
+        assert!(
+            req_rx.try_recv().is_err(),
+            "no page operation (open/save/close/rename/delete/switch) must ever dispatch a \
+             WorkerRequest"
+        );
     }
 }

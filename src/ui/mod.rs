@@ -1,5 +1,6 @@
 pub mod editor;
 pub mod grid;
+pub mod pages;
 pub mod picker;
 pub mod tree;
 
